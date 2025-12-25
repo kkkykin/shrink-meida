@@ -230,25 +230,34 @@ class WebDAVClient:
             h.update(extra)
         return h
 
-    def _req(self, method: str, url: str, *, headers: Optional[Dict[str, str]] = None, data: Any = None, stream_path: Optional[Path] = None) -> HttpResp:
+    def _req(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        data: Any = None,
+        stream_path: Optional[Path] = None,
+        follow_redirects: bool = False,
+    ) -> HttpResp:
         url = normalize_url(url)
         h = self._headers(url, headers)
         try:
             if stream_path:
                 with stream_path.open("rb") as f:
-                    r = self._client.request(method, url, headers=h, content=f)
+                    r = self._client.request(method, url, headers=h, content=f, follow_redirects=follow_redirects)
             else:
-                r = self._client.request(method, url, headers=h, data=data)
+                r = self._client.request(method, url, headers=h, data=data, follow_redirects=follow_redirects)
         except httpx.HTTPError as e:
             raise RuntimeError(f"WebDAV request error: {e}") from e
         return HttpResp(status=r.status_code, reason=r.reason_phrase or "", headers=dict(r.headers), body=r.content)
 
     # ---- 基础方法 ----
     def head(self, url: str) -> HttpResp:
-        return self._req("HEAD", url)
+        return self._req("HEAD", url, follow_redirects=True)
 
     def get_bytes(self, url: str) -> Tuple[HttpResp, bytes]:
-        r = self._req("GET", url)
+        r = self._req("GET", url, follow_redirects=True)
         return r, r.body or b""
 
     def get_text(self, url: str) -> Tuple[HttpResp, str]:
@@ -278,7 +287,7 @@ class WebDAVClient:
 
     def propfind(self, url: str, *, depth: str) -> Tuple[HttpResp, bytes]:
         headers = {"Depth": depth}
-        r = self._req("PROPFIND", url, headers=headers)
+        r = self._req("PROPFIND", url, headers=headers, follow_redirects=True)
         return r, r.body or b""
 
     # ---- 便利方法 ----
