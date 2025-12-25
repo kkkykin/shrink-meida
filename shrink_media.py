@@ -209,6 +209,8 @@ class WebDAVClient:
         self.timeout = timeout
         self._mkdir_cache: set[str] = set()
         self._client = httpx.Client(verify=not insecure, timeout=timeout)
+        # 兼容不允许 MKCOL 根路径的服务器：记录根是否可写
+        self._mkcol_root_allowed: Dict[str, bool] = {}
 
     # ---- 内部工具 ----
     def _pick_cred(self, url: str) -> Tuple[Optional[str], Optional[str]]:
@@ -284,10 +286,15 @@ class WebDAVClient:
         dir_url = normalize_url(dir_url)
         if not dir_url.endswith("/"):
             dir_url += "/"
-        # 递归创建路径各层
+
         pu = urlparse(dir_url)
         parts = pu.path.split("/")
         cur = ""
+
+        # detect root availability once per netloc
+        netloc_key = f"{pu.scheme}://{pu.netloc}"
+        root_probe = self._mkcol_root_allowed.get(netloc_key)
+
         for part in parts:
             if part == "":
                 continue
@@ -295,11 +302,25 @@ class WebDAVClient:
             u = normalize_url(urlunparse((pu.scheme, pu.netloc, cur + "/", "", "", "")))
             if u in self._mkdir_cache:
                 continue
+
+            # skip MKCOL on root segments if server rejects (405) and path already exists
             resp = self.mkcol(u)
-            if resp.status in (201, 405):
+            if resp.status == 201:
                 self._mkdir_cache.add(u)
                 continue
-            # 其他错误忽略，后续目录可能已存在
+            if resp.status == 405:
+                # remember that MKCOL is disallowed on this netloc (common on some servers)
+                if root_probe is None:
+                    self._mkcol_root_allowed[netloc_key] = False
+                # still cache to avoid repeating failing calls
+                self._mkdir_cache.add(u)
+                continue
+            if resp.status == 409:
+                # parent missing; treat as not created and continue upward
+                continue
+            # other errors ignored; later ops may succeed if it already exists
+            self._mkdir_cache.add(u)
+
         self._mkdir_cache.add(dir_url)
 
 
@@ -606,29 +627,36 @@ class LockBackend:
     def _now(self) -> float:
         return time.time()
 
-    def try_acquire(self, key: str) -> bool:
+    def try_acquire(self, key: str) -> Tuple[bool, str]:
         token = sha1_hex(key)
         now = self._now()
 
         if self.local_dir is not None:
             lock_path = self.local_dir / f"{token}.lock"
 
-            if lock_path.exists() and self.steal_stale:
+            if lock_path.exists():
                 try:
                     obj = json.loads(lock_path.read_text("utf-8", errors="replace") or "{}")
-                    ts = float(obj.get("ts", 0))
-                    if now - ts > self.ttl_sec:
+                    ts = float(obj.get("ts", 0) or 0)
+                    owner = str(obj.get("device_id", ""))
+                    stale = now - ts > self.ttl_sec
+                    same = owner == self.device_id
+                    if stale or same:
                         lock_path.unlink(missing_ok=True)  # type: ignore
                 except Exception:
-                    pass
+                    # if metadata broken, treat as stale
+                    try:
+                        lock_path.unlink(missing_ok=True)  # type: ignore
+                    except Exception:
+                        return False, "local lock present (cannot remove)"
 
             try:
                 fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False))
-                return True
+                return True, "ok"
             except FileExistsError:
-                return False
+                return False, "local lock active"
 
         assert self.client is not None and self.remote_dir_url is not None
         lock_dir = normalize_url(self.remote_dir_url + quote(token) + "/")
@@ -637,36 +665,82 @@ class LockBackend:
         resp = self.client.mkcol(lock_dir)
         if resp.status == 201:
             self.client.put_text(owner_url, json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False))
-            return True
+            return True, "ok"
+
+        if resp.status == 405:
+            # server forbids MKCOL (path probably exists) → try writing owner directly
+            # Some servers reject MKCOL but allow PUT file directly if dir exists
+            put0 = self.client.put_text(
+                owner_url, json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False), headers={"If-None-Match": "*"}
+            )
+            if put0.status in (200, 201, 204):
+                return True, "claimed existing"
+            if put0.status == 409:
+                # parent missing: we cannot create; treat as fatal for this lock
+                return False, "owner create 409 (parent missing)"
+            if put0.status == 405:
+                # server forbids writing owner file; give clearer reason
+                return False, "owner create 405 (PUT forbidden)"
+            if put0.status == 412:
+                # someone raced us; fall through to read existing owner
+                pass
+            else:
+                return False, f"owner create {put0.status}"
 
         if resp.status not in (405, 409):
-            return False
+            return False, f"mkcol failed {resp.status}"
 
-        if not self.steal_stale:
-            return False
-
+        # existing dir; read or create owner
         try:
             r, txt = self.client.get_text(owner_url)
+            if r.status == 404:
+                # orphaned lock dir without owner file -> try to claim
+                put = self.client.put_text(
+                    owner_url, json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False), headers={"If-None-Match": "*"}
+                )
+                if put.status in (200, 201, 204):
+                    return True, "claimed orphan"
+                if put.status == 405:
+                    return False, "owner create 405 (PUT forbidden)"
+                if put.status == 409:
+                    return False, "owner create 409 (parent missing)"
+                if put.status == 412:
+                    return False, "owner raced"
+                # other errors fall through
+                return False, f"owner create {put.status}"
             if r.status >= 400:
-                return False
+                return False, f"owner read {r.status}"
             obj = json.loads(txt or "{}")
-            ts = float(obj.get("ts", 0))
-            if now - ts <= self.ttl_sec:
-                return False
+            ts = float(obj.get("ts", 0) or 0)
+            owner = str(obj.get("device_id", ""))
         except Exception:
-            return False
+            return False, "owner read/parse failed"
 
+        stale = now - ts > self.ttl_sec if ts > 0 else True
+        same = owner == self.device_id
+
+        if not (same or (self.steal_stale and stale)):
+            return False, f"locked by {owner or 'unknown'}"
+
+        # try to rewrite owner without deleting dir first (cheaper and works on servers that disallow DELETE on non-empty)
+        put = self.client.put_text(owner_url, json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False))
+        if put.status in (200, 201, 204):
+            return True, "stolen" if stale or same else "ok"
+        if put.status == 405:
+            return False, "owner create 405 (PUT forbidden)"
+
+        # fallback: delete + recreate
         try:
             self.client.delete(owner_url)
             self.client.delete(lock_dir)
         except Exception:
-            return False
+            return False, "lock cleanup failed"
 
         resp2 = self.client.mkcol(lock_dir)
         if resp2.status == 201:
             self.client.put_text(owner_url, json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False))
-            return True
-        return False
+            return True, "stolen" if stale or same else "ok"
+        return False, f"recreate failed {resp2.status}"
 
     def release(self, key: str) -> None:
         token = sha1_hex(key)
@@ -2125,8 +2199,9 @@ def main() -> None:
     def worker(it: WorkItem) -> Tuple[WorkItem, JobResult]:
         # lock
         if not args.dry_run:
-            if not coord.locks.try_acquire(it.rel):
-                return it, JobResult(True, "skip", "locked by other device", None, None)
+            acquired, reason = coord.locks.try_acquire(it.rel)
+            if not acquired:
+                return it, JobResult(True, "skip", f"lock failed: {reason}", None, None)
             safe_append("processing", it)
 
         try:
