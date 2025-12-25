@@ -891,7 +891,7 @@ def has_encoder(enc: str) -> bool:
     return enc in ffmpeg_encoders()
 
 
-def ffprobe_json(path: Path, *, dry_run: bool) -> Optional[Dict[str, Any]]:
+def ffprobe_json(path: str | Path, *, dry_run: bool) -> Optional[Dict[str, Any]]:
     cp = subprocess.run(
         [
             "ffprobe",
@@ -1068,7 +1068,7 @@ def replace_last(cmd: List[str], new_last: str) -> List[str]:
 
 
 def build_video_cmd_single(
-    in_path: Path,
+    in_path: str | Path,
     out_path: Path,
     info: MediaInfo,
     *,
@@ -1201,7 +1201,7 @@ def build_video_cmd_single(
 
 
 def build_video_candidates(
-    in_path: Path,
+    in_path: str | Path,
     out_path: Path,
     info: MediaInfo,
     *,
@@ -1259,7 +1259,7 @@ def build_video_candidates(
 
 
 def build_audio_candidates(
-    in_path: Path,
+    in_path: str | Path,
     out_path: Path,
     info: MediaInfo,
     *,
@@ -1348,7 +1348,7 @@ def build_audio_candidates(
 
 
 def build_image_candidates(
-    in_path: Path,
+    in_path: str | Path,
     out_path: Path,
     *,
     image_codec: str,  # webp/avif
@@ -1765,13 +1765,36 @@ def process_one_local(
     comic_keep_non_images: bool,
     comic_accept_bigger: bool,
     archive_password: Optional[str],
+    src_url: Optional[str] = None,
+    rel_override: Optional[str] = None,
+    src_size_hint: int = 0,
+    allow_remote_stream: bool = False,
+    webdav_client: Optional[WebDAVClient] = None,
 ) -> JobResult:
-    rel = src_local.relative_to(in_root).as_posix()
+    rel = rel_override or src_local.relative_to(in_root).as_posix()
+    src_arg = src_url if (allow_remote_stream and src_url) else str(src_local)
+
+    def ensure_local() -> Optional[str]:
+        if src_local.exists():
+            return None
+        if not src_url or not webdav_client:
+            return "no local file and cannot fetch"
+        ensure_parent(src_local)
+        r = webdav_client.get_bytes(src_url)
+        if r[0].status >= 400:
+            return f"download failed {r[0].status} {r[0].reason}"
+        src_local.write_bytes(r[1])
+        return None
+
+    def src_size_val() -> int:
+        if src_local.exists():
+            return size_of(src_local)
+        return src_size_hint
 
     probe = None
     info0 = classify(src_local, None)
     if info0.kind in {"video", "audio", "image"}:
-        probe = ffprobe_json(src_local, dry_run=dry_run)
+        probe = ffprobe_json(src_arg, dry_run=dry_run)
     info = classify(src_local, probe)
 
     # subtitle/other -> copy
@@ -1779,11 +1802,17 @@ def process_one_local(
         dst = out_root / rel
         if dry_run:
             return JobResult(True, "dry-run", f"{info.kind} would copy", None, rel)
+        err = ensure_local()
+        if err:
+            return JobResult(False, "fail", err)
         copy_file_local(src_local, dst, overwrite=overwrite)
         return JobResult(True, "copy", f"{info.kind} copied", dst, rel)
 
     # comic/archive
     if info.kind == "comic":
+        err = ensure_local()
+        if err:
+            return JobResult(False, "fail", err)
         archiver = find_7z()
         if not archiver:
             return JobResult(False, "fail", "missing 7z/7zz")
@@ -1807,6 +1836,9 @@ def process_one_local(
         if skip:
             if dry_run:
                 return JobResult(True, "dry-run", f"comic smart-skip: {reason}", None, dst_cbz.relative_to(out_root).as_posix())
+            err = ensure_local()
+            if err:
+                return JobResult(False, "fail", err)
             copy_file_local(src_local, out_root / rel, overwrite=overwrite)
             return JobResult(True, "copy", f"comic smart-skip -> copied original ({reason})", out_root / rel, rel)
 
@@ -1830,10 +1862,16 @@ def process_one_local(
             if not try_archives:
                 if dry_run:
                     return JobResult(True, "dry-run", "archive try disabled -> would copy", None, rel)
+                err = ensure_local()
+                if err:
+                    return JobResult(False, "fail", err)
                 copy_file_local(src_local, out_root / rel, overwrite=overwrite)
                 return JobResult(True, "copy", "archive copied (try disabled)", out_root / rel, rel)
             if dry_run:
                 return JobResult(True, "dry-run", msg, None, rel)
+            err = ensure_local()
+            if err:
+                return JobResult(False, "fail", err)
             copy_file_local(src_local, out_root / rel, overwrite=overwrite)
             return JobResult(True, "copy", msg, out_root / rel, rel)
 
@@ -1843,13 +1881,16 @@ def process_one_local(
         if dry_run:
             return JobResult(True, "dry-run", msg, None, dst_cbz.relative_to(out_root).as_posix())
 
-        src_sz = size_of(src_local)
+        src_sz = src_size_val()
         out_sz = size_of(dst_cbz)
         if src_sz > 0 and out_sz > 0 and out_sz >= src_sz * (1.0 - min_savings) and not comic_accept_bigger:
             try:
                 dst_cbz.unlink()
             except Exception:
                 pass
+            err = ensure_local()
+            if err:
+                return JobResult(False, "fail", err)
             copy_file_local(src_local, out_root / rel, overwrite=overwrite)
             return JobResult(True, "copy", f"{msg}; not smaller -> copied original", out_root / rel, rel)
 
@@ -1861,6 +1902,9 @@ def process_one_local(
         dst = out_root / rel
         if dry_run:
             return JobResult(True, "dry-run", f"already {image_target_ext}", None, rel)
+        err = ensure_local()
+        if err:
+            return JobResult(False, "fail", err)
         copy_file_local(src_local, dst, overwrite=overwrite)
         return JobResult(True, "copy", f"already {image_target_ext.lstrip('.')}, copied", dst, rel)
 
@@ -1876,7 +1920,7 @@ def process_one_local(
         out_final = dst_base.with_suffix("." + container2)
 
         candidates = build_video_candidates(
-            src_local,
+            src_arg,
             out_final,
             info,
             container_pref=container,
@@ -1895,13 +1939,16 @@ def process_one_local(
         if dry_run:
             return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
 
-        src_sz = size_of(src_local)
+        src_sz = src_size_val()
         out_sz = size_of(out_final)
         if src_sz > 0 and out_sz > 0 and out_sz >= src_sz * (1.0 - min_savings):
             try:
                 out_final.unlink()
             except Exception:
                 pass
+            err = ensure_local()
+            if err:
+                return JobResult(False, "fail", err)
             copy_file_local(src_local, dst_base, overwrite=overwrite)
             return JobResult(True, "copy", f"not enough savings ({src_sz}->{out_sz}) -> copied original", dst_base, rel)
 
@@ -1909,10 +1956,13 @@ def process_one_local(
 
     if info.kind == "audio":
         out_final = dst_base.with_suffix(".opus" if audio_policy != "always_copy" else src_local.suffix)
-        cmds = build_audio_candidates(src_local, out_final, info, audio_policy=audio_policy)
+        cmds = build_audio_candidates(src_arg, out_final, info, audio_policy=audio_policy)
         if not cmds:
             if dry_run:
                 return JobResult(True, "dry-run", "no audio stream -> copy", None, rel)
+            err = ensure_local()
+            if err:
+                return JobResult(False, "fail", err)
             copy_file_local(src_local, dst_base, overwrite=overwrite)
             return JobResult(True, "copy", "no audio stream -> copied", dst_base, rel)
 
@@ -1922,13 +1972,16 @@ def process_one_local(
         if dry_run:
             return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
 
-        src_sz = size_of(src_local)
+        src_sz = src_size_val()
         out_sz = size_of(out_final)
         if src_sz > 0 and out_sz > 0 and out_sz >= src_sz * (1.0 - min_savings):
             try:
                 out_final.unlink()
             except Exception:
                 pass
+            err = ensure_local()
+            if err:
+                return JobResult(False, "fail", err)
             copy_file_local(src_local, dst_base, overwrite=overwrite)
             return JobResult(True, "copy", f"not enough savings ({src_sz}->{out_sz}) -> copied original", dst_base, rel)
 
@@ -1940,7 +1993,7 @@ def process_one_local(
         out_final = dst_base.with_suffix(image_target_ext)
 
         candidates = build_image_candidates(
-            src_local,
+            src_arg,
             out_final,
             image_codec=image_codec,
             webp_quality=webp_quality,
@@ -1955,13 +2008,16 @@ def process_one_local(
         if dry_run:
             return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
 
-        src_sz = size_of(src_local)
+        src_sz = src_size_val()
         out_sz = size_of(out_final)
         if src_sz > 0 and out_sz > 0 and out_sz >= src_sz * (1.0 - min_savings):
             try:
                 out_final.unlink()
             except Exception:
                 pass
+            err = ensure_local()
+            if err:
+                return JobResult(False, "fail", err)
             copy_file_local(src_local, dst_base, overwrite=overwrite)
             return JobResult(True, "copy", f"not enough savings ({src_sz}->{out_sz}) -> copied original", dst_base, rel)
 
@@ -1970,6 +2026,9 @@ def process_one_local(
     dst = out_root / rel
     if dry_run:
         return JobResult(True, "dry-run", "fallback copy", None, rel)
+    err = ensure_local()
+    if err:
+        return JobResult(False, "fail", err)
     copy_file_local(src_local, dst, overwrite=overwrite)
     return JobResult(True, "copy", "fallback copied", dst, rel)
 
@@ -2034,6 +2093,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--webdav-pass", type=str, default=None)
     ap.add_argument("--webdav-insecure", action="store_true")
     ap.add_argument("--webdav-timeout", type=int, default=60)
+    ap.add_argument("--stream-remote", action="store_true", help="use remote URL directly as ffmpeg input (WebDAV)")
 
     # multi-device
     ap.add_argument("--device-id", type=str, default=None)
@@ -2221,13 +2281,29 @@ def main() -> None:
                 local_src = in_tmp_root / it.rel
                 ensure_parent(local_src)
 
-                if it.is_remote:
+                use_stream = (
+                    args.stream_remote
+                    and it.is_remote
+                    and (not args.dry_run)
+                )
+
+                stream_url = it.src_url
+                if use_stream and webdav_client is not None and it.src_url is not None:
+                    pu = urlparse(it.src_url)
+                    if not pu.username and (args.webdav_user is not None or args.webdav_pass is not None):
+                        user = quote(args.webdav_user or "")
+                        pwd = quote(args.webdav_pass or "")
+                        auth = f"{user}:{pwd}@" if (user or pwd) else ""
+                        netloc = auth + (pu.netloc or "")
+                        stream_url = urlunparse((pu.scheme, netloc, pu.path, pu.params, pu.query, pu.fragment))
+
+                if it.is_remote and not use_stream:
                     assert webdav_client is not None and it.src_url is not None
                     r = webdav_client.get_bytes(it.src_url)
                     if r[0].status >= 400:
                         return it, JobResult(False, "fail", f"download failed {r[0].status} {r[0].reason}")
                     local_src.write_bytes(r[1])
-                else:
+                elif not it.is_remote:
                     assert it.src_local is not None
                     if not args.dry_run:
                         shutil.copy2(it.src_local, local_src)
@@ -2260,6 +2336,11 @@ def main() -> None:
                     comic_keep_non_images=args.comic_keep_non_images,
                     comic_accept_bigger=args.comic_accept_bigger,
                     archive_password=args.archive_password,
+                    src_url=stream_url,
+                    rel_override=it.rel,
+                    src_size_hint=it.src_size,
+                    allow_remote_stream=use_stream,
+                    webdav_client=webdav_client,
                 )
 
                 if args.dry_run:
