@@ -29,6 +29,7 @@ import concurrent.futures as cf
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -1378,7 +1379,15 @@ def run_ffmpeg_with_candidates(
         except Exception:
             pass
 
-        cp = subprocess.run(cmd2, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # ffmpeg 可能输出非 UTF-8 字符（例如携带非 UTF-8 元数据），避免 decode 失败
+        cp = subprocess.run(
+            cmd2,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
         if cp.returncode == 0:
             try:
@@ -1960,7 +1969,14 @@ def main() -> None:
         log_err("ERROR: --inplace 与 --output 不能同时使用。")
         sys.exit(2)
 
-    device_id = args.device_id or os.uname().nodename
+    # Windows 无 os.uname；platform.node/COMPUTERNAME 作为回退
+    if args.device_id:
+        device_id = args.device_id
+    else:
+        try:
+            device_id = os.uname().nodename  # type: ignore[attr-defined]
+        except AttributeError:
+            device_id = platform.node() or os.environ.get("COMPUTERNAME") or "unknown"
 
     webdav_client: Optional[WebDAVClient] = None
     if is_url(args.input) or (args.output and is_url(args.output)):
