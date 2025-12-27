@@ -320,12 +320,36 @@ class OpenListClientSync:
         token = self._client.get_token()
         if token:
             headers["Authorization"] = token
-        sign = ""
+
+        # OpenList 的 /d 下载接口在部分场景下需要 sign，否则会返回 401（如 expire missing）。
+        # 同时，OpenList 的 fs.info 在“对象不存在”时可能不会抛异常，而是返回“空对象”（取决于 openlist 客户端版本）。
+        # 这里统一用 fs.info 的返回来判断存在性，并拿到 sign，避免依赖下载时报错来区分不存在。
         try:
             info = await self._client.fs.info(p)
-            sign = getattr(info, "sign", "") or ""
-        except Exception:
-            pass
+        except Exception as e:
+            msg = str(e).lower()
+            if "not found" in msg or "object not found" in msg:
+                raise FileNotFoundError(p)
+            raise
+
+        if info is None:
+            raise FileNotFoundError(p)
+        # 兼容“空对象”表示不存在：data=null 时常见字段可能为空/None。
+        name = getattr(info, "name", None)
+        path = getattr(info, "path", None)
+        sign0 = getattr(info, "sign", None)
+        size0 = getattr(info, "size", None)
+        modified0 = getattr(info, "modified", None)
+        if (
+            name in (None, "")
+            and path in (None, "")
+            and sign0 in (None, "")
+            and (size0 in (None, 0))
+            and modified0 is None
+        ):
+            raise FileNotFoundError(p)
+
+        sign = str(sign0 or "")
         url_path = f"/d{quote(p, safe='/')}"
         if sign:
             sep = "&" if "?" in url_path else "?"
