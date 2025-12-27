@@ -194,6 +194,8 @@ class OpenListClientSync:
         self._thread = threading.Thread(target=self._start_loop, daemon=True)
         self._thread.start()
         self._client: Optional[Client] = None
+        self._pending_mu = threading.Lock()
+        self._pending: set[cf.Future[Any]] = set()
         self._call(self._init_client(timeout))
         assert self._client is not None
         self._call(self._client.login(user, password, otp_key=otp_key))
@@ -204,15 +206,35 @@ class OpenListClientSync:
 
     def _call(self, coro: Any) -> Any:
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result()
+        with self._pending_mu:
+            self._pending.add(fut)
+        try:
+            return fut.result()
+        finally:
+            with self._pending_mu:
+                self._pending.discard(fut)
 
     async def _init_client(self, timeout: int) -> None:
-        self._client = Client(self.base_url, auto_refresh=False)
+        self._client = Client(self.base_url, auto_refresh=True)
         self._client.context.httpx_client = httpx.AsyncClient(
             base_url=self.base_url, follow_redirects=True, timeout=timeout
         )
 
+    def cancel_pending(self) -> None:
+        # Ctrl-C 场景：让阻塞在 _call().result() 的线程尽快退出，避免非 daemon 线程阻止进程退出。
+        with self._pending_mu:
+            futs = list(self._pending)
+        for f in futs:
+            try:
+                f.cancel()
+            except Exception:
+                pass
+
     def close(self) -> None:
+        try:
+            self.cancel_pending()
+        except Exception:
+            pass
         try:
             if self._client is not None:
                 self._call(self._client.close())
@@ -256,7 +278,7 @@ class OpenListClientSync:
             page = 1
             got = 0
             while True:
-                res = await self._client.fs.listdir(cur, per_page=100, page=page)
+                res = await self._client.fs.listdir(cur, refresh=True, per_page=100, page=page)
                 for obj in res.content:
                     child_path = posixpath.join(cur, obj.name)
                     if obj.is_dir:
@@ -1643,7 +1665,16 @@ def process_comic_to_cbz(
 # ------------------------
 
 
-def upload_file_remote(client: OpenListClientSync, local_file: Path, dst_path: str, *, overwrite: bool) -> None:
+def upload_file_remote(
+    client: OpenListClientSync,
+    local_file: Path,
+    dst_path: str,
+    *,
+    overwrite: bool,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise cf.CancelledError()
     parent = posixpath.dirname(dst_path.rstrip("/")) or "/"
     client.ensure_dir(parent)
     size = local_file.stat().st_size
@@ -1653,7 +1684,11 @@ def upload_file_remote(client: OpenListClientSync, local_file: Path, dst_path: s
             if ok:
                 return
         except Exception as e:
-            log_err(f"[WARN] direct upload failed, fallback normal: {e}")
+            if isinstance(e, cf.CancelledError) or (cancel_event is not None and cancel_event.is_set()):
+                raise
+            log_err(f"[WARN] direct upload failed, fallback normal: {e!r}")
+    if cancel_event is not None and cancel_event.is_set():
+        raise cf.CancelledError()
     client.upload_file(dst_path, local_file, overwrite=overwrite)
 
 
@@ -2215,6 +2250,8 @@ def main() -> None:
         if args.prefetch_debug or args.debug:
             log(f"[PREFETCH] {msg}")
 
+    stop_event = threading.Event()
+
     # 异步上传（让“转码”与“上传”在不同线程池中流水线并行）
     upload_dir: Optional[Path] = None
     upload_executor: Optional[cf.ThreadPoolExecutor] = None
@@ -2289,6 +2326,8 @@ def main() -> None:
         def pump_prefetch() -> None:
             if prefetch_executor is None or prefetch_iter is None:
                 return
+            if stop_event.is_set():
+                return
             if not prefetch_pump_mu.acquire(blocking=False):
                 return
             try:
@@ -2325,8 +2364,6 @@ def main() -> None:
     if out_is_remote:
         log(f"Remote upload async: {'ON' if upload_executor is not None else 'OFF'} | upload jobs: {args.upload_jobs}")
 
-    stop_event = threading.Event()
-
     def _sig(_s: int, _f: Any) -> None:
         stop_event.set()
         raise KeyboardInterrupt()
@@ -2356,7 +2393,7 @@ def main() -> None:
             if jr.out_local is None or jr.out_rel is None:
                 return it, JobResult(True, "skip", "no output generated")
             dbg(f"upload {jr.out_local} -> {dst_path}")
-            upload_file_remote(remote_client, jr.out_local, dst_path, overwrite=args.overwrite)
+            upload_file_remote(remote_client, jr.out_local, dst_path, overwrite=args.overwrite, cancel_event=stop_event)
             return it, JobResult(True, jr.action, jr.msg, None, jr.out_rel)
         except Exception as e:
             return it, JobResult(False, "fail", f"upload failed: {e}")
@@ -2366,7 +2403,7 @@ def main() -> None:
                     jr.out_local.unlink(missing_ok=True)
                 except Exception:
                     pass
-            if not args.dry_run:
+            if not args.dry_run and not stop_event.is_set():
                 coord.locks.release(it.rel)
             if upload_slots is not None:
                 try:
@@ -2506,7 +2543,7 @@ def main() -> None:
                         return StageResult(it, jr, upload_dst_path=dst_path)
                     try:
                         dbg(f"upload {jr.out_local} -> {dst_path}")
-                        upload_file_remote(remote_client, jr.out_local, dst_path, overwrite=args.overwrite)
+                        upload_file_remote(remote_client, jr.out_local, dst_path, overwrite=args.overwrite, cancel_event=stop_event)
                     except Exception as e:
                         return StageResult(it, JobResult(False, "fail", f"upload failed: {e}"))
                     return StageResult(it, JobResult(True, jr.action, jr.msg, None, jr.out_rel))
@@ -2514,7 +2551,7 @@ def main() -> None:
                 return StageResult(it, jr)
 
         finally:
-            if lock_acquired and not defer_release and not args.dry_run:
+            if lock_acquired and not defer_release and not args.dry_run and not stop_event.is_set():
                 coord.locks.release(it.rel)
 
     def finalize(it: WorkItem, jr: JobResult) -> None:
@@ -2681,6 +2718,11 @@ def main() -> None:
 
     except KeyboardInterrupt:
         stop_event.set()
+        if remote_client is not None:
+            try:
+                remote_client.cancel_pending()
+            except Exception:
+                pass
 
     if stop_event.is_set():
         log("\nInterrupted. done 已写入 state；processing 会保留并在 TTL 超时后可被接管。")
