@@ -663,6 +663,37 @@ class LockBackend:
     def _now(self) -> float:
         return time.time()
 
+    def is_active(self, key: str) -> bool:
+        """
+        Best-effort 判断锁是否“仍然有效”（存在且未超过 TTL）。
+        - 仅用于提升 liveness：如果无法确认（网络/解析错误），返回 False 让任务继续跑。
+        """
+        token = sha1_hex(key)
+        now = self._now()
+
+        if self.local_dir is not None:
+            lock_path = self.local_dir / f"{token}.lock"
+            if not lock_path.exists():
+                return False
+            try:
+                obj = json.loads(lock_path.read_text("utf-8", errors="replace") or "{}")
+                ts = float(obj.get("ts", 0) or 0)
+            except Exception:
+                return False
+            return ts > 0 and (now - ts) <= self.ttl_sec
+
+        assert self.client is not None and self.remote_dir_path is not None
+        lock_file = remote_join(self.remote_dir_path, f"{token}.lock")
+        try:
+            txt = self.client.read_text(lock_file)
+            obj = json.loads(txt or "{}")
+            ts = float(obj.get("ts", 0) or 0)
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+        return ts > 0 and (now - ts) <= self.ttl_sec
+
     def try_acquire(self, key: str) -> Tuple[bool, str]:
         token = sha1_hex(key)
         now = self._now()
@@ -677,10 +708,14 @@ class LockBackend:
                     owner = str(obj.get("device_id", ""))
                     stale = now - ts > self.ttl_sec
                     same = owner == self.device_id
-                    if stale or same:
+                    if same or (self.steal_stale and stale):
                         lock_path.unlink(missing_ok=True)  # type: ignore
+                    else:
+                        return False, f"locked by {owner or 'unknown'}"
                 except Exception:
-                    # if metadata broken, treat as stale
+                    # metadata broken：默认按“活跃锁”处理；只有在允许 steal 时才尝试清理
+                    if not self.steal_stale:
+                        return False, "local lock present (bad metadata)"
                     try:
                         lock_path.unlink(missing_ok=True)  # type: ignore
                     except Exception:
@@ -712,7 +747,11 @@ class LockBackend:
                 return False, f"locked by {owner or 'unknown'}"
         except FileNotFoundError:
             stale = True
-        except Exception:
+        except Exception as e:
+            # 读锁失败：为了不断跑（默认 steal_stale=ON）可以继续尝试接管；
+            # 但当明确关闭 steal 时，应该把它当作“有人在跑/未知状态”来避免误抢。
+            if not self.steal_stale:
+                return False, f"lock read failed: {e}"
             stale = True
 
         try:
@@ -805,13 +844,22 @@ class Coordinator:
             return False
         return ent.src_size == it.src_size and ent.src_mtime_ns == it.src_mtime_ns
 
-    def is_processing(self, it: WorkItem) -> bool:
+    def is_processing(self, it: WorkItem, *, current_device_id: Optional[str] = None) -> bool:
         ent = self.load_latest().get(it.rel)
         if not ent:
             return False
         if ent.status != "processing":
             return False
-        return (self._now() - ent.ts) <= self.ttl_sec
+        if (self._now() - ent.ts) > self.ttl_sec:
+            return False
+        # 同设备中断/重启：不要因为旧的 processing 阻塞自己继续跑
+        if current_device_id and ent.device_id == current_device_id:
+            return False
+        # processing 仅作为提示；真实“是否有人在跑”以 lock 为准（读失败则当作不活跃，优先不断跑）
+        try:
+            return self.locks.is_active(it.rel)
+        except Exception:
+            return False
 
     def append(self, status: str, it: WorkItem, *, dst_rel: Optional[str] = None) -> None:
         rec = {
@@ -2245,7 +2293,7 @@ def main() -> None:
         if coord.is_done(it):
             done_cnt += 1
             continue
-        if coord.is_processing(it):
+        if coord.is_processing(it, current_device_id=device_id):
             proc_cnt += 1
             continue
         todo.append(it)
