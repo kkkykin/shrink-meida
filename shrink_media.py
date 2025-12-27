@@ -250,6 +250,17 @@ class OpenListClientSync:
     def list_recursive(self, root_path: str) -> List[RemoteEntry]:
         return self._call(self._list_recursive(root_path))
 
+    def listdir(self, path: str, *, refresh: bool = False, per_page: int = 30) -> Any:
+        assert self._client is not None
+        return self._call(
+            self._client.fs.listdir(
+                path if path.startswith("/") else f"/{path}",
+                refresh=refresh,
+                page=1,
+                per_page=per_page,
+            )
+        )
+
     async def _list_recursive(self, root_path: str) -> List[RemoteEntry]:
         root_norm = root_path.rstrip("/") or "/"
         entries: List[RemoteEntry] = []
@@ -618,10 +629,12 @@ class StateBackend:
         # Remote append 采用“读旧文本 + 覆盖上传”。read_all() 的“吞异常返回空串”适合容错读取，
         # 但用于 append 时会导致网络抖动/鉴权异常时把历史 state 当作空串覆盖，破坏多设备协同。
         # 因此这里显式读取并在失败时抛错，让上层 safe_append 记录 WARN 而不是清空 state。
+        created_new = False
         try:
             old = self.client.read_text(self.remote_path)
         except FileNotFoundError:
             old = ""
+            created_new = True
         except Exception as e:
             raise RuntimeError(f"state read failed: {e}")
         new = old
@@ -629,6 +642,12 @@ class StateBackend:
             new += "\n"
         new += line + "\n"
         self.client.upload_text(self.remote_path, new, overwrite=True)
+        if created_new:
+            # OpenList 服务端偶尔不会立即刷新“新创建文件”的状态；触发一次 listdir(refresh=True) 提示它更新。
+            try:
+                self.client.listdir(parent, refresh=True, per_page=1)
+            except Exception:
+                pass
 
 
 class LockBackend:
@@ -760,6 +779,11 @@ class LockBackend:
                 json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False),
                 overwrite=True,
             )
+            # OpenList 服务端偶尔不会立即刷新“新创建/更新 lock 文件”的状态；触发一次 listdir(refresh=True) 提示它更新。
+            try:
+                self.client.listdir(self.remote_dir_path, refresh=True, per_page=1)
+            except Exception:
+                pass
             return True, "stolen" if (stale and owner) else "ok"
         except Exception as e:
             return False, f"lock write failed: {e}"
@@ -778,6 +802,11 @@ class LockBackend:
         lock_file = remote_join(self.remote_dir_path, f"{token}.lock")
         try:
             self.client.remove(lock_file)
+        except Exception:
+            pass
+        # 删除锁后也刷新一下目录，避免服务端缓存导致其他设备仍“看见”旧锁。
+        try:
+            self.client.listdir(self.remote_dir_path, refresh=True, per_page=1)
         except Exception:
             pass
 
