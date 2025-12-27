@@ -615,7 +615,15 @@ class StateBackend:
             self.client.ensure_dir(parent)
         except Exception:
             pass
-        old = self.read_all()
+        # Remote append 采用“读旧文本 + 覆盖上传”。read_all() 的“吞异常返回空串”适合容错读取，
+        # 但用于 append 时会导致网络抖动/鉴权异常时把历史 state 当作空串覆盖，破坏多设备协同。
+        # 因此这里显式读取并在失败时抛错，让上层 safe_append 记录 WARN 而不是清空 state。
+        try:
+            old = self.client.read_text(self.remote_path)
+        except FileNotFoundError:
+            old = ""
+        except Exception as e:
+            raise RuntimeError(f"state read failed: {e}")
         new = old
         if new and not new.endswith("\n"):
             new += "\n"
@@ -2416,21 +2424,24 @@ def main() -> None:
         # lock
         lock_acquired = False
         defer_release = False
-        if not args.dry_run:
-            acquired, reason = coord.locks.try_acquire(it.rel)
-            if not acquired:
-                dbg(f"lock skip {it.rel}: {reason}")
-                return StageResult(it, JobResult(True, "skip", f"lock failed: {reason}", None, None))
-            dbg(f"lock ok {it.rel}")
-            lock_acquired = True
-            safe_append("processing", it)
-            latest = coord.load_latest(force=True)
-            ent = latest.get(it.rel)
-            if ent and ent.status == "done" and ent.src_size == it.src_size and ent.src_mtime_ns == it.src_mtime_ns:
-                dbg(f"already done elsewhere {it.rel}")
-                return StageResult(it, JobResult(True, "skip", "already done by other device", None, ent.dst_rel))
-
         try:
+            if not args.dry_run:
+                acquired, reason = coord.locks.try_acquire(it.rel)
+                if not acquired:
+                    dbg(f"lock skip {it.rel}: {reason}")
+                    return StageResult(it, JobResult(True, "skip", f"lock failed: {reason}", None, None))
+                dbg(f"lock ok {it.rel}")
+                lock_acquired = True
+
+                # 重新拉取最新 state（避免 todo 构建时的缓存导致重复处理）
+                latest = coord.load_latest(force=True)
+                ent = latest.get(it.rel)
+                if ent and ent.status == "done" and ent.src_size == it.src_size and ent.src_mtime_ns == it.src_mtime_ns:
+                    dbg(f"already done elsewhere {it.rel}")
+                    return StageResult(it, JobResult(True, "skip", "already done by other device", None, ent.dst_rel))
+
+                safe_append("processing", it)
+
             with tempfile.TemporaryDirectory(prefix="shrink_in_", ignore_cleanup_errors=True) as td_in, tempfile.TemporaryDirectory(
                 prefix="shrink_out_", ignore_cleanup_errors=True
             ) as td_out:
@@ -2473,19 +2484,19 @@ def main() -> None:
                                 except Exception:
                                     pass
                             except Exception as e:
-                                return it, JobResult(False, "fail", f"prefetch copy failed: {e}")
+                                return StageResult(it, JobResult(False, "fail", f"prefetch copy failed: {e}"))
                         else:
                             try:
                                 dbg(f"prefetch miss -> download {it.remote_path}")
                                 remote_client.download_to(it.remote_path, local_src)
                             except Exception as e:
-                                return it, JobResult(False, "fail", f"prefetch+download failed: {err or e}")
+                                return StageResult(it, JobResult(False, "fail", f"prefetch+download failed: {err or e}"))
                     else:
                         try:
                             dbg(f"download {it.remote_path} -> {local_src}")
                             remote_client.download_to(it.remote_path, local_src)
                         except Exception as e:
-                            return it, JobResult(False, "fail", f"download failed: {e}")
+                            return StageResult(it, JobResult(False, "fail", f"download failed: {e}"))
                 else:
                     assert it.src_local is not None
                     if not args.dry_run:
