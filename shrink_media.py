@@ -2006,6 +2006,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="预取远端输入文件的并发数（仅远端输入；0 表示关闭）",
     )
+    ap.add_argument(
+        "--upload-jobs",
+        type=int,
+        default=0,
+        help="异步上传远端输出的并发数（仅远端输出；0 表示在 worker 内同步上传）",
+    )
 
     # multi-device
     ap.add_argument("--device-id", type=str, default=None)
@@ -2185,6 +2191,18 @@ def main() -> None:
         if args.prefetch_debug or args.debug:
             log(f"[PREFETCH] {msg}")
 
+    # 异步上传（让“转码”与“上传”在不同线程池中流水线并行）
+    upload_dir: Optional[Path] = None
+    upload_executor: Optional[cf.ThreadPoolExecutor] = None
+    upload_slots: Optional[threading.BoundedSemaphore] = None
+
+    if out_is_remote and args.upload_jobs > 0 and remote_client is not None and todo and not args.dry_run:
+        upload_dir = Path(tempfile.mkdtemp(prefix="shrink_upload_"))
+        dbg(f"upload dir: {upload_dir}")
+        upload_executor = cf.ThreadPoolExecutor(max_workers=args.upload_jobs)
+        # bounded backlog：最多允许 2x 并发数的上传任务“在途”（含排队与执行），避免输出在本地无限堆积
+        upload_slots = threading.BoundedSemaphore(max(1, args.upload_jobs) * 2)
+
     # 远端预取
     prefetch_dir: Optional[Path] = None
     prefetch_futs: Dict[str, cf.Future[Tuple[bool, Optional[Path], str]]] = {}
@@ -2195,6 +2213,7 @@ def main() -> None:
     prefetch_executor: Optional[cf.ThreadPoolExecutor] = None
     prefetch_iter: Optional[Iterator[WorkItem]] = None
     prefetch_mu = threading.Lock()
+    prefetch_pump_mu = threading.Lock()
 
     def pump_prefetch() -> None:
         return
@@ -2246,26 +2265,31 @@ def main() -> None:
         def pump_prefetch() -> None:
             if prefetch_executor is None or prefetch_iter is None:
                 return
-            while True:
-                with prefetch_mu:
-                    running = len(prefetch_futs)
-                    cached = len(prefetch_results)
-                pdebug(f"pump running={running} cached={cached}")
-                # Only count running ones toward the window, but don't start if a cached
-                # result exists for a different item to avoid blowing through the list.
-                # Start next only when there is no cached item pending consumption.
-                if running >= args.prefetch or cached > 0:
-                    pdebug(f"window hold (running={running}, cached={cached})")
-                    break
-                try:
-                    nxt = next(prefetch_iter)
-                except StopIteration:
-                    pdebug("no more to prefetch")
-                    break
-                if not nxt.is_remote or nxt.remote_path is None:
-                    continue
-                pdebug(f"dequeue {nxt.rel}")
-                submit_prefetch(nxt)
+            if not prefetch_pump_mu.acquire(blocking=False):
+                return
+            try:
+                while True:
+                    with prefetch_mu:
+                        running = len(prefetch_futs)
+                        cached = len(prefetch_results)
+                    pdebug(f"pump running={running} cached={cached}")
+                    # Only count running ones toward the window, but don't start if a cached
+                    # result exists for a different item to avoid blowing through the list.
+                    # Start next only when there is no cached item pending consumption.
+                    if running >= args.prefetch or cached > 0:
+                        pdebug(f"window hold (running={running}, cached={cached})")
+                        break
+                    try:
+                        nxt = next(prefetch_iter)
+                    except StopIteration:
+                        pdebug("no more to prefetch")
+                        break
+                    if not nxt.is_remote or nxt.remote_path is None:
+                        continue
+                    pdebug(f"dequeue {nxt.rel}")
+                    submit_prefetch(nxt)
+            finally:
+                prefetch_pump_mu.release()
 
         pump_prefetch()
 
@@ -2274,6 +2298,8 @@ def main() -> None:
     log(f"Output: {'(inplace)' if args.inplace else (out_root_display or '')}")
     log(f"Device: {device_id} | lock ttl: {args.lock_ttl}s | steal stale: {'ON' if args.steal_stale_lock else 'OFF'}")
     log(f"Video encoder: {args.video_encoder} | Image codec: {args.image_codec}")
+    if out_is_remote:
+        log(f"Remote upload async: {'ON' if upload_executor is not None else 'OFF'} | upload jobs: {args.upload_jobs}")
 
     stop_event = threading.Event()
 
@@ -2288,27 +2314,60 @@ def main() -> None:
     skipped = 0
     failed = 0
 
+    @dataclass
+    class StageResult:
+        it: WorkItem
+        jr: JobResult
+        upload_dst_path: Optional[str] = None
+
     def safe_append(status: str, it: WorkItem, *, dst_rel: Optional[str] = None) -> None:
         try:
             coord.append(status, it, dst_rel=dst_rel)
         except Exception as e:
             log_err(f"[WARN] state append failed ({status}) for {it.rel}: {e}")
 
-    def worker(it: WorkItem) -> Tuple[WorkItem, JobResult]:
+    def upload_worker(it: WorkItem, jr: JobResult, dst_path: str) -> Tuple[WorkItem, JobResult]:
+        assert remote_client is not None
+        try:
+            if jr.out_local is None or jr.out_rel is None:
+                return it, JobResult(True, "skip", "no output generated")
+            dbg(f"upload {jr.out_local} -> {dst_path}")
+            upload_file_remote(remote_client, jr.out_local, dst_path, overwrite=args.overwrite)
+            return it, JobResult(True, jr.action, jr.msg, None, jr.out_rel)
+        except Exception as e:
+            return it, JobResult(False, "fail", f"upload failed: {e}")
+        finally:
+            if jr.out_local is not None:
+                try:
+                    jr.out_local.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if not args.dry_run:
+                coord.locks.release(it.rel)
+            if upload_slots is not None:
+                try:
+                    upload_slots.release()
+                except ValueError:
+                    pass
+
+    def worker(it: WorkItem) -> StageResult:
         dbg(f"start {it.rel} remote={it.is_remote} size={it.src_size}")
         # lock
+        lock_acquired = False
+        defer_release = False
         if not args.dry_run:
             acquired, reason = coord.locks.try_acquire(it.rel)
             if not acquired:
                 dbg(f"lock skip {it.rel}: {reason}")
-                return it, JobResult(True, "skip", f"lock failed: {reason}", None, None)
+                return StageResult(it, JobResult(True, "skip", f"lock failed: {reason}", None, None))
             dbg(f"lock ok {it.rel}")
+            lock_acquired = True
             safe_append("processing", it)
             latest = coord.load_latest(force=True)
             ent = latest.get(it.rel)
             if ent and ent.status == "done" and ent.src_size == it.src_size and ent.src_mtime_ns == it.src_mtime_ns:
                 dbg(f"already done elsewhere {it.rel}")
-                return it, JobResult(True, "skip", "already done by other device", None, ent.dst_rel)
+                return StageResult(it, JobResult(True, "skip", "already done by other device", None, ent.dst_rel))
 
         try:
             with tempfile.TemporaryDirectory(prefix="shrink_in_", ignore_cleanup_errors=True) as td_in, tempfile.TemporaryDirectory(
@@ -2372,7 +2431,10 @@ def main() -> None:
                         dbg(f"local copy {it.src_local} -> {local_src}")
                         shutil.copy2(it.src_local, local_src)
 
-                local_out_root = out_tmp_root if out_is_remote else out_root_local  # type: ignore
+                if out_is_remote:
+                    local_out_root = upload_dir if upload_dir is not None else out_tmp_root
+                else:
+                    local_out_root = out_root_local  # type: ignore
 
                 jr = process_one_local(
                     local_src,
@@ -2405,27 +2467,30 @@ def main() -> None:
                 )
 
                 if args.dry_run:
-                    return it, jr
+                    return StageResult(it, jr)
 
                 if not jr.ok:
-                    return it, jr
+                    return StageResult(it, jr)
 
                 if out_is_remote:
                     assert remote_client is not None and out_root_remote_path is not None
                     if jr.out_local is None or jr.out_rel is None:
-                        return it, JobResult(True, "skip", "no output generated")
+                        return StageResult(it, JobResult(True, "skip", "no output generated"))
                     dst_path = remote_join(out_root_remote_path, jr.out_rel)
+                    if upload_executor is not None and upload_dir is not None and upload_slots is not None:
+                        defer_release = True
+                        return StageResult(it, jr, upload_dst_path=dst_path)
                     try:
                         dbg(f"upload {jr.out_local} -> {dst_path}")
                         upload_file_remote(remote_client, jr.out_local, dst_path, overwrite=args.overwrite)
                     except Exception as e:
-                        return it, JobResult(False, "fail", f"upload failed: {e}")
-                    return it, JobResult(True, jr.action, jr.msg, None, jr.out_rel)
+                        return StageResult(it, JobResult(False, "fail", f"upload failed: {e}"))
+                    return StageResult(it, JobResult(True, jr.action, jr.msg, None, jr.out_rel))
 
-                return it, jr
+                return StageResult(it, jr)
 
         finally:
-            if not args.dry_run:
+            if lock_acquired and not defer_release and not args.dry_run:
                 coord.locks.release(it.rel)
 
     def finalize(it: WorkItem, jr: JobResult) -> None:
@@ -2457,22 +2522,59 @@ def main() -> None:
             safe_append("fail", it, dst_rel=None)
 
     try:
+        upload_futs: Dict[cf.Future[Tuple[WorkItem, JobResult]], WorkItem] = {}
+
         if args.jobs <= 1:
             for it in todo:
                 if stop_event.is_set():
                     break
                 try:
-                    it2, jr = worker(it)
-                    finalize(it2, jr)
+                    st = worker(it)
+                    if st.upload_dst_path is not None:
+                        if upload_executor is None or upload_slots is None:
+                            finalize(st.it, JobResult(False, "fail", "internal: upload executor not available"))
+                            if not args.dry_run:
+                                coord.locks.release(st.it.rel)
+                            continue
+                        upload_slots.acquire()
+                        try:
+                            uf = upload_executor.submit(upload_worker, st.it, st.jr, st.upload_dst_path)
+                        except Exception as e:
+                            try:
+                                upload_slots.release()
+                            except ValueError:
+                                pass
+                            finalize(st.it, JobResult(False, "fail", f"upload submit failed: {e}"))
+                            if not args.dry_run:
+                                coord.locks.release(st.it.rel)
+                            continue
+                        upload_futs[uf] = st.it
+                    else:
+                        finalize(st.it, st.jr)
                 except Exception as e:
                     failed += 1
                     log_err(f"[FAIL] worker exception: {e}")
                     if not args.dry_run:
                         safe_append("fail", it, dst_rel=None)
+            while upload_futs and not stop_event.is_set():
+                done, _ = cf.wait(upload_futs.keys(), timeout=0.5, return_when=cf.FIRST_COMPLETED)
+                if not done:
+                    continue
+                for fut in done:
+                    it_ref = upload_futs.pop(fut, None)
+                    try:
+                        it2, jr = fut.result()
+                    except Exception as e:
+                        failed += 1
+                        log_err(f"[FAIL] upload exception: {e}")
+                        if it_ref is not None and not args.dry_run:
+                            safe_append("fail", it_ref, dst_rel=None)
+                        continue
+                    finalize(it2, jr)
         else:
             with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
                 it_iter = iter(todo)
-                futures: Dict[cf.Future[Tuple[WorkItem, JobResult]], WorkItem] = {}
+                proc_futs: Dict[cf.Future[StageResult], WorkItem] = {}
 
                 def submit_next() -> bool:
                     if stop_event.is_set():
@@ -2481,33 +2583,75 @@ def main() -> None:
                         it0 = next(it_iter)
                     except StopIteration:
                         return False
-                    futures[ex.submit(worker, it0)] = it0
+                    proc_futs[ex.submit(worker, it0)] = it0
                     return True
 
                 for _ in range(args.jobs):
                     if not submit_next():
                         break
 
-                while futures and not stop_event.is_set():
-                    done, _ = cf.wait(futures.keys(), timeout=0.5, return_when=cf.FIRST_COMPLETED)
+                while (proc_futs or upload_futs) and not stop_event.is_set():
+                    all_futs: List[cf.Future[Any]] = list(proc_futs.keys()) + list(upload_futs.keys())
+                    done, _ = cf.wait(all_futs, timeout=0.5, return_when=cf.FIRST_COMPLETED)
                     if not done:
                         continue
                     for fut in done:
-                        it_ref = futures.pop(fut, None)
+                        it_ref = proc_futs.pop(fut, None)
+                        if it_ref is not None:
+                            try:
+                                st = fut.result()
+                            except Exception as e:
+                                failed += 1
+                                log_err(f"[FAIL] worker exception: {e}")
+                                if not args.dry_run:
+                                    safe_append("fail", it_ref, dst_rel=None)
+                                if not stop_event.is_set():
+                                    submit_next()
+                                continue
+
+                            if st.upload_dst_path is not None:
+                                if upload_executor is None or upload_slots is None:
+                                    finalize(st.it, JobResult(False, "fail", "internal: upload executor not available"))
+                                    if not args.dry_run:
+                                        coord.locks.release(st.it.rel)
+                                else:
+                                    upload_slots.acquire()
+                                    try:
+                                        uf = upload_executor.submit(upload_worker, st.it, st.jr, st.upload_dst_path)
+                                    except Exception as e:
+                                        try:
+                                            upload_slots.release()
+                                        except ValueError:
+                                            pass
+                                        finalize(st.it, JobResult(False, "fail", f"upload submit failed: {e}"))
+                                        if not args.dry_run:
+                                            coord.locks.release(st.it.rel)
+                                    else:
+                                        upload_futs[uf] = st.it
+                            else:
+                                finalize(st.it, st.jr)
+
+                            if not stop_event.is_set():
+                                submit_next()
+                            continue
+
+                        it_ref2 = upload_futs.pop(fut, None)
+                        if it_ref2 is None:
+                            continue
                         try:
                             it2, jr = fut.result()
                         except Exception as e:
                             failed += 1
-                            log_err(f"[FAIL] worker exception: {e}")
-                            if it_ref is not None and not args.dry_run:
-                                safe_append("fail", it_ref, dst_rel=None)
+                            log_err(f"[FAIL] upload exception: {e}")
+                            if not args.dry_run:
+                                safe_append("fail", it_ref2, dst_rel=None)
                             continue
                         finalize(it2, jr)
-                        if not stop_event.is_set():
-                            submit_next()
 
                 if stop_event.is_set():
-                    for fut in list(futures.keys()):
+                    for fut in list(proc_futs.keys()):
+                        fut.cancel()
+                    for fut in list(upload_futs.keys()):
                         fut.cancel()
                     ex.shutdown(wait=False, cancel_futures=True)
 
@@ -2523,6 +2667,15 @@ def main() -> None:
         try:
             dbg(f"cleanup prefetch dir {prefetch_dir}")
             shutil.rmtree(prefetch_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    if upload_executor is not None:
+        upload_executor.shutdown(wait=not stop_event.is_set(), cancel_futures=stop_event.is_set())
+    if upload_dir is not None:
+        try:
+            dbg(f"cleanup upload dir {upload_dir}")
+            shutil.rmtree(upload_dir, ignore_errors=True)
         except Exception:
             pass
 
