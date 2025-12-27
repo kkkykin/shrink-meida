@@ -3,33 +3,35 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "httpx>=0.27",
+#   "openlist",
 # ]
 # [[tool.uv.index]]
 # url = "https://mirrors.ustc.edu.cn/pypi/simple/"
 # ///
 
 """
-shrink-media: 多媒体“瘦身”工具，支持本地/ WebDAV 输入输出 + 多设备协同。
+shrink-media: 多媒体“瘦身”工具，支持本地 / OpenList 远端输入输出 + 多设备协同。
 
 特点（与旧版一致/增强）:
 - 视频/音频/图片/漫画压缩包处理，体积不够小则回退复制
-- WebDAV 递归遍历、上传 (PUT+MOVE)、远端 state/lock，跨设备安全
+- OpenList 递归遍历、分片上传，远端 state/lock，跨设备安全
 - 可选多线程；dry-run 预览；NVENC 优先，回退 x265/x264；opus/aac 音频；webp/avif 图片
 
 设计思路：
-- 单文件 + 标准库为主，WebDAV 用 httpx 以简化 TLS/重试
-- 结构化模块：配置、WebDAV、状态锁、分类与转码、漫画处理、执行器
+- 单文件 + 标准库为主，远端使用 openlist 客户端
+- 结构化模块：配置、远端 IO、状态锁、分类与转码、漫画处理、执行器
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
+import asyncio
 import concurrent.futures as cf
 import hashlib
 import json
 import os
 import platform
+import posixpath
 import re
 import shutil
 import signal
@@ -40,13 +42,12 @@ import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import quote, unquote, urlparse, urlunparse
+from urllib.parse import quote, urlparse
 
 import httpx
-import xml.etree.ElementTree as ET
+from openlist import Client
 
 # ------------------------
 # 常量/扩展名
@@ -67,9 +68,6 @@ BITMAP_SUB_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"
 
 STATE_DEFAULT_NAME = ".shrink_media_state.jsonl"
 LOCKS_DIR_NAME = ".shrink_media_locks"
-
-SAFE_PATH = "/%:@-._~!$&'()*+,;="
-SAFE_QUERY = "%=&:@/?-._~!$'()*+,;"
 
 # ------------------------
 # 简易日志
@@ -149,279 +147,298 @@ def find_7z() -> Optional[str]:
 
 
 # ------------------------
-# WebDAV 辅助
+# OpenList 辅助
 # ------------------------
 
-def normalize_url(u: str) -> str:
+
+def parse_remote_location(u: str) -> Tuple[str, str]:
     pu = urlparse(u)
+    base = f"{pu.scheme}://{pu.netloc}"
     path = pu.path or "/"
-    q = pu.query or ""
-    path_enc = quote(path, safe=SAFE_PATH)
-    q_enc = quote(q, safe=SAFE_QUERY)
-    return urlunparse((pu.scheme, pu.netloc, path_enc, pu.params, q_enc, pu.fragment))
+    if not path.startswith("/"):
+        path = "/" + path
+    return base.rstrip("/"), path
 
 
-def strip_userinfo(u: str) -> str:
-    pu = urlparse(u)
-    host = pu.hostname or ""
-    netloc = f"{host}:{pu.port}" if pu.port else host
-    return urlunparse((pu.scheme, netloc, pu.path, pu.params, pu.query, pu.fragment))
+def remote_join(root: str, rel: str) -> str:
+    root_clean = root.rstrip("/")
+    rel_clean = posixpath.normpath(rel).lstrip("/")
+    if root_clean == "":
+        return "/" + rel_clean if rel_clean else "/"
+    return f"{root_clean}/{rel_clean}" if rel_clean else (root_clean + "/")
 
 
-def webdav_join(root: str, rel: str) -> str:
-    root = normalize_url(root)
-    if not root.endswith("/"):
-        root += "/"
-    parts = [quote(p, safe="!$&'()*+,;=:@-._~") for p in rel.split("/") if p]
-    return normalize_url(root + "/".join(parts))
-
-
-def webdav_dirname(url: str) -> str:
-    url = normalize_url(url)
-    pu = urlparse(url)
-    path = pu.path or "/"
-    if path.endswith("/"):
-        path = path[:-1]
-    i = path.rfind("/")
-    dir_path = "/" if i <= 0 else path[:i + 1]
-    return normalize_url(urlunparse((pu.scheme, pu.netloc, dir_path, "", "", "")))
-
-
-@dataclass
-class HttpResp:
-    status: int
-    reason: str
-    headers: Dict[str, str]
-    body: bytes | None = None
-
-
-class WebDAVClient:
-    """
-    轻量 WebDAV 客户端，使用 httpx。
-    - 支持 URL 内嵌或参数传入的 Basic 认证
-    - 实现 HEAD / GET / PUT / MOVE / DELETE / MKCOL / PROPFIND
-    """
-
-    def __init__(self, user: Optional[str], password: Optional[str], *, insecure: bool, timeout: int) -> None:
-        self.user = user
-        self.password = password
-        self.insecure = insecure
-        self.timeout = timeout
-        self._mkdir_cache: set[str] = set()
-        self._client = httpx.Client(verify=not insecure, timeout=timeout)
-        # 兼容不允许 MKCOL 根路径的服务器：记录根是否可写
-        self._mkcol_root_allowed: Dict[str, bool] = {}
-
-    # ---- 内部工具 ----
-    def _pick_cred(self, url: str) -> Tuple[Optional[str], Optional[str]]:
-        if self.user is not None or self.password is not None:
-            return self.user, self.password
-        pu = urlparse(url)
-        return pu.username, pu.password
-
-    def _headers(self, url: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        u, p = self._pick_cred(url)
-        h: Dict[str, str] = {}
-        if u is not None or p is not None:
-            raw = f"{u or ''}:{p or ''}".encode("utf-8")
-            token = base64.b64encode(raw).decode("ascii")
-            h["Authorization"] = f"Basic {token}"
-        if extra:
-            h.update(extra)
-        return h
-
-    def _req(
-        self,
-        method: str,
-        url: str,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        data: Any = None,
-        stream_path: Optional[Path] = None,
-        follow_redirects: bool = False,
-    ) -> HttpResp:
-        url = normalize_url(url)
-        h = self._headers(url, headers)
-        try:
-            if stream_path:
-                with stream_path.open("rb") as f:
-                    r = self._client.request(method, url, headers=h, content=f, follow_redirects=follow_redirects)
-            else:
-                r = self._client.request(method, url, headers=h, data=data, follow_redirects=follow_redirects)
-        except httpx.HTTPError as e:
-            raise RuntimeError(f"WebDAV request error: {e}") from e
-        return HttpResp(status=r.status_code, reason=r.reason_phrase or "", headers=dict(r.headers), body=r.content)
-
-    # ---- 基础方法 ----
-    def head(self, url: str) -> HttpResp:
-        return self._req("HEAD", url, follow_redirects=True)
-
-    def get_bytes(self, url: str) -> Tuple[HttpResp, bytes]:
-        r = self._req("GET", url, follow_redirects=True)
-        return r, r.body or b""
-
-    def get_text(self, url: str) -> Tuple[HttpResp, str]:
-        r, b = self.get_bytes(url)
-        return r, (b or b"").decode("utf-8", errors="replace")
-
-    def put_bytes(self, url: str, body: bytes, *, headers: Optional[Dict[str, str]] = None) -> HttpResp:
-        return self._req("PUT", url, headers=headers, data=body)
-
-    def put_text(self, url: str, text: str, *, headers: Optional[Dict[str, str]] = None) -> HttpResp:
-        return self.put_bytes(url, text.encode("utf-8"), headers=headers)
-
-    def request_upload(self, url: str, local_file: Path, *, headers: Optional[Dict[str, str]] = None) -> HttpResp:
-        return self._req("PUT", url, headers=headers, stream_path=local_file)
-
-    def delete(self, url: str) -> HttpResp:
-        return self._req("DELETE", url)
-
-    def move(self, src_url: str, dst_url: str, *, overwrite: bool) -> HttpResp:
-        headers = {"Destination": normalize_url(dst_url)}
-        if overwrite:
-            headers["Overwrite"] = "T"
-        return self._req("MOVE", src_url, headers=headers)
-
-    def mkcol(self, url: str) -> HttpResp:
-        return self._req("MKCOL", url)
-
-    def propfind(self, url: str, *, depth: str) -> Tuple[HttpResp, bytes]:
-        headers = {"Depth": depth}
-        r = self._req("PROPFIND", url, headers=headers, follow_redirects=True)
-        return r, r.body or b""
-
-    # ---- 便利方法 ----
-    def ensure_dir(self, dir_url: str) -> None:
-        dir_url = normalize_url(dir_url)
-        if not dir_url.endswith("/"):
-            dir_url += "/"
-
-        pu = urlparse(dir_url)
-        parts = pu.path.split("/")
-        cur = ""
-
-        # detect root availability once per netloc
-        netloc_key = f"{pu.scheme}://{pu.netloc}"
-        root_probe = self._mkcol_root_allowed.get(netloc_key)
-
-        for part in parts:
-            if part == "":
-                continue
-            cur += "/" + part
-            u = normalize_url(urlunparse((pu.scheme, pu.netloc, cur + "/", "", "", "")))
-            if u in self._mkdir_cache:
-                continue
-
-            # skip MKCOL on root segments if server rejects (405) and path already exists
-            resp = self.mkcol(u)
-            if resp.status == 201:
-                self._mkdir_cache.add(u)
-                continue
-            if resp.status == 405:
-                # remember that MKCOL is disallowed on this netloc (common on some servers)
-                if root_probe is None:
-                    self._mkcol_root_allowed[netloc_key] = False
-                # still cache to avoid repeating failing calls
-                self._mkdir_cache.add(u)
-                continue
-            if resp.status == 409:
-                # parent missing; treat as not created and continue upward
-                continue
-            # other errors ignored; later ops may succeed if it already exists
-            self._mkdir_cache.add(u)
-
-        self._mkdir_cache.add(dir_url)
-
-
-# ------------------------
-# WebDAV 目录遍历
-# ------------------------
-
-@dataclass
-class RemoteEntry:
-    rel: str
-    href: str
-    is_dir: bool
-    size: int
-    mtime_ns: int
-
-
-def _dav_text(el: Optional[ET.Element]) -> str:
-    return (el.text or "").strip() if el is not None else ""
-
-
-def _parse_http_date_to_ns(s: str) -> int:
+def _mtime_to_ns(dt: Any) -> int:
     try:
-        dt = parsedate_to_datetime(s)
         return int(dt.timestamp() * 1_000_000_000)
     except Exception:
         return 0
 
 
-def list_webdav_recursive(client: WebDAVClient, root_url: str) -> List[RemoteEntry]:
-    root_url = normalize_url(root_url)
-    if not root_url.endswith("/"):
-        root_url += "/"
-    root_pu = urlparse(root_url)
-    root_path = unquote(root_pu.path)
-    ns = {"d": "DAV:"}
+@dataclass
+class RemoteEntry:
+    rel: str
+    path: str
+    is_dir: bool
+    size: int
+    mtime_ns: int
+    sign: str = ""
 
-    def walk(dir_url: str) -> List[RemoteEntry]:
-        dir_url = normalize_url(dir_url)
-        if not dir_url.endswith("/"):
-            dir_url += "/"
 
-        r, b = client.propfind(dir_url, depth="1")
-        if r.status not in (207, 200):
-            raise RuntimeError(f"PROPFIND failed {r.status} {r.reason}: {dir_url}")
+class OpenListClientSync:
+    """同步包装，便于在现有同步代码里调用 OpenList 异步客户端。"""
 
-        xml = ET.fromstring(b)
+    def __init__(self, base_url: str, user: str, password: str, *, timeout: int, otp_key: Optional[str] = None) -> None:
+        self.base_url = base_url.rstrip("/")
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._start_loop, daemon=True)
+        self._thread.start()
+        self._client: Optional[Client] = None
+        self._call(self._init_client(timeout))
+        assert self._client is not None
+        self._call(self._client.login(user, password, otp_key=otp_key))
+
+    def _start_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _call(self, coro: Any) -> Any:
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result()
+
+    async def _init_client(self, timeout: int) -> None:
+        self._client = Client(self.base_url, auto_refresh=False)
+        self._client.context.httpx_client = httpx.AsyncClient(
+            base_url=self.base_url, follow_redirects=True, timeout=timeout
+        )
+
+    def close(self) -> None:
+        try:
+            if self._client is not None:
+                self._call(self._client.close())
+        except Exception:
+            pass
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=1)
+        except Exception:
+            pass
+
+    # ---- 枚举 ----
+    def list_recursive(self, root_path: str) -> List[RemoteEntry]:
+        return self._call(self._list_recursive(root_path))
+
+    async def _list_recursive(self, root_path: str) -> List[RemoteEntry]:
+        root_norm = root_path.rstrip("/") or "/"
         entries: List[RemoteEntry] = []
 
-        for resp in xml.findall("d:response", ns):
-            href_el = resp.find("d:href", ns)
-            href = _dav_text(href_el)
-            if not href:
-                continue
+        try:
+            assert self._client is not None
+            root_info = await self._client.fs.info(root_norm)
+        except Exception as e:
+            raise RuntimeError(f"remote info failed: {e}")
 
-            if href.startswith("http://") or href.startswith("https://"):
-                href_full = normalize_url(href)
-                href_path = unquote(urlparse(href_full).path)
-            else:
-                href_path_raw = href
-                href_path = unquote(href_path_raw)
-                href_full = normalize_url(urlunparse((root_pu.scheme, root_pu.netloc, href_path_raw, "", "", "")))
+        if not root_info.is_dir:
+            entries.append(
+                RemoteEntry(
+                    rel=posixpath.basename(root_norm),
+                    path=root_norm,
+                    is_dir=False,
+                    size=root_info.size,
+                    mtime_ns=_mtime_to_ns(root_info.modified),
+                    sign=getattr(root_info, "sign", "") or "",
+                )
+            )
+            return entries
 
-            if href_path.rstrip("/") == unquote(urlparse(dir_url).path).rstrip("/"):
-                continue
+        async def walk(cur: str) -> None:
+            assert self._client is not None
+            page = 1
+            got = 0
+            while True:
+                res = await self._client.fs.listdir(cur, per_page=100, page=page)
+                for obj in res.content:
+                    child_path = posixpath.join(cur, obj.name)
+                    if obj.is_dir:
+                        await walk(child_path)
+                        continue
+                    rel = posixpath.relpath(child_path, root_norm).replace("\\", "/")
+                    entries.append(
+                        RemoteEntry(
+                            rel=rel,
+                            path=child_path,
+                            is_dir=False,
+                            size=obj.size,
+                            mtime_ns=_mtime_to_ns(obj.modified),
+                            sign=getattr(obj, "sign", "") or "",
+                        )
+                    )
+                got += len(res.content)
+                if got >= res.total or not res.content:
+                    break
+                page += 1
 
-            prop = resp.find(".//d:prop", ns)
-            if prop is None:
-                continue
+        await walk(root_norm)
+        return entries
 
-            is_collection = prop.find("d:resourcetype/d:collection", ns) is not None
-            size_txt = _dav_text(prop.find("d:getcontentlength", ns))
-            lm_txt = _dav_text(prop.find("d:getlastmodified", ns))
+    # ---- 下载 / 读取 ----
+    def download_to(self, remote_path: str, local_path: Path) -> None:
+        self._call(self._download_to(remote_path, local_path))
 
-            size = int(size_txt) if size_txt.isdigit() else 0
-            mtime_ns = _parse_http_date_to_ns(lm_txt) if lm_txt else 0
+    def read_bytes(self, remote_path: str) -> bytes:
+        return self._call(self._read_bytes(remote_path))
 
-            if href_path.startswith(root_path):
-                rel = href_path[len(root_path):].lstrip("/")
-            else:
-                rel = href_path.lstrip("/")
-            rel = rel.rstrip("/") if is_collection else rel
-            entries.append(RemoteEntry(rel=rel, href=href_full, is_dir=is_collection, size=size, mtime_ns=mtime_ns))
+    def read_text(self, remote_path: str) -> str:
+        b = self.read_bytes(remote_path)
+        return b.decode("utf-8", errors="replace")
 
-        out: List[RemoteEntry] = []
-        for e in entries:
-            if e.is_dir:
-                out.extend(walk(e.href))
-            else:
-                out.append(e)
-        return out
+    async def _download_to(self, remote_path: str, local_path: Path) -> None:
+        url_path, headers = await self._download_request(remote_path)
+        assert self._client is not None
+        async with self._client.context.httpx_client.stream("GET", url_path, headers=headers) as r:
+            if r.status_code >= 400:
+                raise RuntimeError(f"download failed {r.status_code} {r.reason_phrase}")
+            ensure_parent(local_path)
+            with local_path.open("wb") as f:
+                async for chunk in r.aiter_bytes():
+                    f.write(chunk)
 
-    return walk(root_url)
+    async def _read_bytes(self, remote_path: str) -> bytes:
+        url_path, headers = await self._download_request(remote_path)
+        assert self._client is not None
+        r = await self._client.context.httpx_client.get(url_path, headers=headers)
+        if r.status_code == 404:
+            raise FileNotFoundError(remote_path)
+        if r.status_code >= 400:
+            raise RuntimeError(f"download failed {r.status_code} {r.reason_phrase}")
+        return r.content
+
+    async def _download_request(self, remote_path: str) -> Tuple[str, Dict[str, str]]:
+        p = remote_path if remote_path.startswith("/") else f"/{remote_path}"
+        headers: Dict[str, str] = {}
+        assert self._client is not None
+        token = self._client.get_token()
+        if token:
+            headers["Authorization"] = token
+        sign = ""
+        try:
+            info = await self._client.fs.info(p)
+            sign = getattr(info, "sign", "") or ""
+        except Exception:
+            pass
+        url_path = f"/d{quote(p, safe='/')}"
+        if sign:
+            sep = "&" if "?" in url_path else "?"
+            url_path += f"{sep}sign={sign}"
+        return url_path, headers
+
+    # ---- 上传 / 写入 ----
+    def upload_file(self, remote_path: str, local_file: Path, *, overwrite: bool) -> None:
+        assert self._client is not None
+        self._call(
+            self._client.fs.upload_file(
+                remote_path if remote_path.startswith("/") else f"/{remote_path}",
+                str(local_file),
+                overwrite=overwrite,
+            )
+        )
+
+    def direct_upload_if_available(self, remote_path: str, local_file: Path, *, overwrite: bool) -> bool:
+        assert self._client is not None
+        size = local_file.stat().st_size
+
+        async def _get_info() -> Optional[Dict[str, Any]]:
+            payload = {
+                "path": str(Path(remote_path).parent).replace("\\", "/"),
+                "file_name": Path(remote_path).name,
+                "file_size": size,
+                "tool": "HttpDirect",
+            }
+            token = self._client.get_token()
+            headers = {"Content-Type": "application/json"}
+            if token:
+                headers["Authorization"] = token
+            r = await self._client.context.httpx_client.post("/api/fs/get_direct_upload_info", json=payload, headers=headers)
+            if r.status_code != 200:
+                return None
+            try:
+                data = r.json()
+            except Exception:
+                return None
+            if data.get("code") != 200:
+                return None
+            return data.get("data")
+
+        info = self._call(_get_info())
+        if not info:
+            return False
+
+        upload_url = info.get("upload_url")
+        chunk_size = int(info.get("chunk_size") or 0) or 5 * 1024 * 1024
+        method = (info.get("method") or "PUT").upper()
+        if not upload_url:
+            return False
+
+        async def _direct_upload() -> None:
+            assert self._client is not None
+
+            async def _upload_chunk(start: int, chunk: bytes) -> None:
+                end = start + len(chunk) - 1
+                headers = {
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {start}-{end}/{size}",
+                }
+                r = await self._client.context.httpx_client.request(method, upload_url, content=chunk, headers=headers)
+                if r.status_code >= 400:
+                    raise RuntimeError(f"direct upload failed {r.status_code} {r.reason_phrase}")
+
+            with local_file.open("rb") as f:
+                offset = 0
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    await _upload_chunk(offset, chunk)
+                    offset += len(chunk)
+
+        self._call(_direct_upload())
+        return True
+
+    def upload_text(self, remote_path: str, text: str, *, overwrite: bool) -> None:
+        data = text.encode("utf-8")
+        self.upload_bytes(remote_path, data, overwrite=overwrite)
+
+    def upload_bytes(self, remote_path: str, data: bytes, *, overwrite: bool) -> None:
+        assert self._client is not None
+        self._call(
+            self._client.fs.upload(
+                remote_path if remote_path.startswith("/") else f"/{remote_path}",
+                data,
+                overwrite=overwrite,
+                last_modified=int(time.time()),
+            )
+        )
+
+    # ---- 其他 ----
+    def ensure_dir(self, path: str) -> None:
+        assert self._client is not None
+        self._call(self._client.fs.makedirs(path if path.startswith("/") else f"/{path}", exist_ok=True))
+
+    def remove(self, path: str) -> None:
+        try:
+            assert self._client is not None
+            self._call(self._client.fs.remove(path if path.startswith("/") else f"/{path}"))
+        except Exception:
+            pass
+
+
+# ------------------------
+# OpenList 目录遍历
+# ------------------------
+
+
+def list_openlist_recursive(client: OpenListClientSync, root_path: str) -> List[RemoteEntry]:
+    return client.list_recursive(root_path)
 
 
 # ------------------------
@@ -433,7 +450,7 @@ class WorkItem:
     rel: str
     is_remote: bool
     src_local: Optional[Path] = None
-    src_url: Optional[str] = None
+    remote_path: Optional[str] = None
     src_size: int = 0
     src_mtime_ns: int = 0
 
@@ -473,11 +490,8 @@ def iter_local_inputs(input_path: Path) -> Tuple[Path, List[WorkItem]]:
     return root, items
 
 
-def iter_webdav_inputs(client: WebDAVClient, root_url: str) -> Tuple[str, List[WorkItem]]:
-    root_url = normalize_url(root_url)
-    if not root_url.endswith("/"):
-        root_url += "/"
-    entries = list_webdav_recursive(client, root_url)
+def iter_remote_inputs(client: OpenListClientSync, root_path: str) -> Tuple[str, List[WorkItem]]:
+    entries = list_openlist_recursive(client, root_path)
     items: List[WorkItem] = []
     for e in entries:
         name = Path(e.rel).name
@@ -489,13 +503,13 @@ def iter_webdav_inputs(client: WebDAVClient, root_url: str) -> Tuple[str, List[W
             WorkItem(
                 rel=e.rel,
                 is_remote=True,
-                src_url=e.href,
+                remote_path=e.path,
                 src_size=e.size,
                 src_mtime_ns=e.mtime_ns,
             )
         )
     items.sort(key=lambda x: x.rel)
-    return root_url, items
+    return root_path, items
 
 
 # ------------------------
@@ -516,15 +530,15 @@ class StateEntry:
 class StateBackend:
     """
     - 本地：直接 append
-    - WebDAV：GET 现有 + CAS (If-Match)；403/405/412 回退普通 PUT
+    - OpenList：读现有文本，追加后整文件覆盖
     """
 
-    def __init__(self, *, local_path: Optional[Path], remote_url: Optional[str], client: Optional[WebDAVClient]) -> None:
+    def __init__(self, *, local_path: Optional[Path], remote_path: Optional[str], client: Optional[OpenListClientSync]) -> None:
         self.local_path = local_path
-        self.remote_url = remote_url
+        self.remote_path = remote_path
         self.client = client
-        if (local_path is None) == (remote_url is None):
-            raise ValueError("StateBackend needs exactly one of local_path or remote_url")
+        if (local_path is None) == (remote_path is None):
+            raise ValueError("StateBackend needs exactly one of local_path or remote_path")
 
     def read_all(self) -> str:
         if self.local_path is not None:
@@ -532,16 +546,13 @@ class StateBackend:
                 return ""
             return self.local_path.read_text("utf-8", errors="replace")
 
-        assert self.client is not None and self.remote_url is not None
-        h = self.client.head(self.remote_url)
-        if h.status == 404:
+        assert self.client is not None and self.remote_path is not None
+        try:
+            return self.client.read_text(self.remote_path)
+        except FileNotFoundError:
             return ""
-        r, txt = self.client.get_text(self.remote_url)
-        if r.status == 404:
+        except Exception:
             return ""
-        if r.status >= 400:
-            raise RuntimeError(f"GET state failed {r.status} {r.reason}")
-        return txt
 
     def append_line(self, line: str) -> None:
         if self.local_path is not None:
@@ -551,56 +562,19 @@ class StateBackend:
                 f.flush()
             return
 
-        assert self.client is not None and self.remote_url is not None
-
-        for _ in range(10):
-            head = self.client.head(self.remote_url)
-            etag = head.headers.get("ETag")
-
-            if head.status == 404:
-                resp = self.client.put_text(self.remote_url, line + "\n", headers={"If-None-Match": "*"})
-                if resp.status in (201, 204):
-                    return
-                if resp.status in (403, 405, 412):
-                    resp2 = self.client.put_text(self.remote_url, line + "\n", headers=None)
-                    if resp2.status in (201, 204):
-                        return
-                    raise RuntimeError(f"PUT state(create) failed {resp2.status} {resp2.reason}")
-                if resp.status == 412:
-                    continue
-                raise RuntimeError(f"PUT state(create) failed {resp.status} {resp.reason}")
-
-            if head.status >= 400:
-                raise RuntimeError(f"HEAD state failed {head.status} {head.reason}")
-
-            r, old = self.client.get_text(self.remote_url)
-            if r.status >= 400:
-                raise RuntimeError(f"GET state failed {r.status} {r.reason}")
-
-            new = old
-            if new and not new.endswith("\n"):
-                new += "\n"
-            new += line + "\n"
-
-            hdr = {"If-Match": etag} if etag else None
-            resp = self.client.put_text(self.remote_url, new, headers=hdr)
-            if resp.status in (201, 204):
-                return
-
-            if resp.status in (403, 405, 412):
-                resp2 = self.client.put_text(self.remote_url, new, headers=None)
-                if resp2.status in (201, 204):
-                    return
-                if resp2.status in (412,):
-                    continue
-                raise RuntimeError(f"PUT state(update) failed {resp2.status} {resp2.reason}")
-
-            if resp.status == 412:
-                continue
-
-            raise RuntimeError(f"PUT state(update) failed {resp.status} {resp.reason}")
-
-        raise RuntimeError("append state failed after retries")
+        assert self.client is not None and self.remote_path is not None
+        # ensure remote parent directory exists
+        parent = posixpath.dirname(self.remote_path.rstrip("/")) or "/"
+        try:
+            self.client.ensure_dir(parent)
+        except Exception:
+            pass
+        old = self.read_all()
+        new = old
+        if new and not new.endswith("\n"):
+            new += "\n"
+        new += line + "\n"
+        self.client.upload_text(self.remote_path, new, overwrite=True)
 
 
 class LockBackend:
@@ -608,30 +582,29 @@ class LockBackend:
         self,
         *,
         local_dir: Optional[Path],
-        remote_dir_url: Optional[str],
-        client: Optional[WebDAVClient],
+        remote_dir_path: Optional[str],
+        client: Optional[OpenListClientSync],
         device_id: str,
         ttl_sec: int,
         steal_stale: bool,
     ) -> None:
         self.local_dir = local_dir
-        self.remote_dir_url = remote_dir_url
+        self.remote_dir_path = remote_dir_path
         self.client = client
         self.device_id = device_id
         self.ttl_sec = ttl_sec
         self.steal_stale = steal_stale
 
-        if (local_dir is None) == (remote_dir_url is None):
-            raise ValueError("LockBackend needs exactly one of local_dir or remote_dir_url")
+        if (local_dir is None) == (remote_dir_path is None):
+            raise ValueError("LockBackend needs exactly one of local_dir or remote_dir_path")
 
         if self.local_dir is not None:
             self.local_dir.mkdir(parents=True, exist_ok=True)
         else:
-            assert self.client is not None and self.remote_dir_url is not None
-            self.remote_dir_url = normalize_url(self.remote_dir_url)
-            if not self.remote_dir_url.endswith("/"):
-                self.remote_dir_url += "/"
-            self.client.ensure_dir(self.remote_dir_url)
+            assert self.client is not None and self.remote_dir_path is not None
+            base = self.remote_dir_path.rstrip("/") or "/"
+            self.remote_dir_path = base
+            self.client.ensure_dir(base)
 
     def _now(self) -> float:
         return time.time()
@@ -667,89 +640,36 @@ class LockBackend:
             except FileExistsError:
                 return False, "local lock active"
 
-        assert self.client is not None and self.remote_dir_url is not None
-        lock_dir = normalize_url(self.remote_dir_url + quote(token) + "/")
-        owner_url = normalize_url(lock_dir + "owner.json")
+        assert self.client is not None and self.remote_dir_path is not None
+        lock_file = remote_join(self.remote_dir_path, f"{token}.lock")
 
-        resp = self.client.mkcol(lock_dir)
-        if resp.status == 201:
-            self.client.put_text(owner_url, json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False))
-            return True, "ok"
+        stale = True
+        same = False
+        owner = ""
 
-        if resp.status == 405:
-            # server forbids MKCOL (path probably exists) → try writing owner directly
-            # Some servers reject MKCOL but allow PUT file directly if dir exists
-            put0 = self.client.put_text(
-                owner_url, json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False), headers={"If-None-Match": "*"}
-            )
-            if put0.status in (200, 201, 204):
-                return True, "claimed existing"
-            if put0.status == 409:
-                # parent missing: we cannot create; treat as fatal for this lock
-                return False, "owner create 409 (parent missing)"
-            if put0.status == 405:
-                # server forbids writing owner file; give clearer reason
-                return False, "owner create 405 (PUT forbidden)"
-            if put0.status == 412:
-                # someone raced us; fall through to read existing owner
-                pass
-            else:
-                return False, f"owner create {put0.status}"
-
-        if resp.status not in (405, 409):
-            return False, f"mkcol failed {resp.status}"
-
-        # existing dir; read or create owner
         try:
-            r, txt = self.client.get_text(owner_url)
-            if r.status == 404:
-                # orphaned lock dir without owner file -> try to claim
-                put = self.client.put_text(
-                    owner_url, json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False), headers={"If-None-Match": "*"}
-                )
-                if put.status in (200, 201, 204):
-                    return True, "claimed orphan"
-                if put.status == 405:
-                    return False, "owner create 405 (PUT forbidden)"
-                if put.status == 409:
-                    return False, "owner create 409 (parent missing)"
-                if put.status == 412:
-                    return False, "owner raced"
-                # other errors fall through
-                return False, f"owner create {put.status}"
-            if r.status >= 400:
-                return False, f"owner read {r.status}"
+            txt = self.client.read_text(lock_file)
             obj = json.loads(txt or "{}")
             ts = float(obj.get("ts", 0) or 0)
             owner = str(obj.get("device_id", ""))
+            stale = now - ts > self.ttl_sec if ts > 0 else True
+            same = owner == self.device_id
+            if not (same or (self.steal_stale and stale)):
+                return False, f"locked by {owner or 'unknown'}"
+        except FileNotFoundError:
+            stale = True
         except Exception:
-            return False, "owner read/parse failed"
+            stale = True
 
-        stale = now - ts > self.ttl_sec if ts > 0 else True
-        same = owner == self.device_id
-
-        if not (same or (self.steal_stale and stale)):
-            return False, f"locked by {owner or 'unknown'}"
-
-        # try to rewrite owner without deleting dir first (cheaper and works on servers that disallow DELETE on non-empty)
-        put = self.client.put_text(owner_url, json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False))
-        if put.status in (200, 201, 204):
-            return True, "stolen" if stale or same else "ok"
-        if put.status == 405:
-            return False, "owner create 405 (PUT forbidden)"
-
-        # fallback: delete + recreate
         try:
-            self.client.delete(owner_url)
-            self.client.delete(lock_dir)
-        except Exception:
-            return False, "lock cleanup failed"
-
-        resp2 = self.client.mkcol(lock_dir)
-        if resp2.status == 201:
-            self.client.put_text(owner_url, json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False))
-            return True, "stolen" if stale or same else "ok"
-        return False, f"recreate failed {resp2.status}"
+            self.client.upload_text(
+                lock_file,
+                json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False),
+                overwrite=True,
+            )
+            return True, "stolen" if (stale and owner) else "ok"
+        except Exception as e:
+            return False, f"lock write failed: {e}"
 
     def release(self, key: str) -> None:
         token = sha1_hex(key)
@@ -761,12 +681,10 @@ class LockBackend:
                 pass
             return
 
-        assert self.client is not None and self.remote_dir_url is not None
-        lock_dir = normalize_url(self.remote_dir_url + quote(token) + "/")
-        owner_url = normalize_url(lock_dir + "owner.json")
+        assert self.client is not None and self.remote_dir_path is not None
+        lock_file = remote_join(self.remote_dir_path, f"{token}.lock")
         try:
-            self.client.delete(owner_url)
-            self.client.delete(lock_dir)
+            self.client.remove(lock_file)
         except Exception:
             pass
 
@@ -1697,25 +1615,22 @@ def process_comic_to_cbz(
 
 
 # ------------------------
-# WebDAV 上传
+# 远端上传
 # ------------------------
 
-def upload_file_webdav(client: WebDAVClient, local_file: Path, dst_url: str, *, overwrite: bool) -> None:
-    dst_url = normalize_url(dst_url)
-    dir_url = webdav_dirname(dst_url)
-    if not dir_url.endswith("/"):
-        dir_url += "/"
-    client.ensure_dir(dir_url)
 
-    tmp_url = normalize_url(dst_url + f".__tmp__{int(time.time()*1000)}")
-    r1 = client.request_upload(tmp_url, local_file)
-    if r1.status >= 400:
-        raise RuntimeError(f"PUT failed {r1.status} {r1.reason}: {dst_url}")
-
-    r2 = client.move(tmp_url, dst_url, overwrite=overwrite)
-    if r2.status >= 400:
-        client.delete(tmp_url)
-        raise RuntimeError(f"MOVE failed {r2.status} {r2.reason}: {dst_url}")
+def upload_file_remote(client: OpenListClientSync, local_file: Path, dst_path: str, *, overwrite: bool) -> None:
+    parent = posixpath.dirname(dst_path.rstrip("/")) or "/"
+    client.ensure_dir(parent)
+    size = local_file.stat().st_size
+    if size > 95 * 1024 * 1024:
+        try:
+            ok = client.direct_upload_if_available(dst_path, local_file, overwrite=overwrite)
+            if ok:
+                return
+        except Exception as e:
+            log_err(f"[WARN] direct upload failed, fallback normal: {e}")
+    client.upload_file(dst_path, local_file, overwrite=overwrite)
 
 
 # ------------------------
@@ -1765,26 +1680,16 @@ def process_one_local(
     comic_keep_non_images: bool,
     comic_accept_bigger: bool,
     archive_password: Optional[str],
-    src_url: Optional[str] = None,
     rel_override: Optional[str] = None,
     src_size_hint: int = 0,
-    allow_remote_stream: bool = False,
-    webdav_client: Optional[WebDAVClient] = None,
 ) -> JobResult:
     rel = rel_override or src_local.relative_to(in_root).as_posix()
-    src_arg = src_url if (allow_remote_stream and src_url) else str(src_local)
+    src_arg = str(src_local)
 
     def ensure_local() -> Optional[str]:
         if src_local.exists():
             return None
-        if not src_url or not webdav_client:
-            return "no local file and cannot fetch"
-        ensure_parent(src_local)
-        r = webdav_client.get_bytes(src_url)
-        if r[0].status >= 400:
-            return f"download failed {r[0].status} {r[0].reason}"
-        src_local.write_bytes(r[1])
-        return None
+        return "no local file available"
 
     def src_size_val() -> int:
         if src_local.exists():
@@ -2038,16 +1943,16 @@ def process_one_local(
 # ------------------------
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="shrink_media: local/WebDAV + multi-device state+locks (rewritten)")
-    ap.add_argument("input", type=str, help="输入（本地路径或 WebDAV URL）")
+    ap = argparse.ArgumentParser(description="shrink_media: local/OpenList + multi-device state+locks")
+    ap.add_argument("input", type=str, help="输入（本地路径或 OpenList URL）")
     ap.add_argument(
         "-o",
         "--output",
         type=str,
         default=None,
-        help="输出（本地路径或 WebDAV URL）。缺省：本地输入用同级 <name>__compressed；WebDAV 输入用同级 <name>__compressed/ 目录。",
+        help="输出（本地路径或 OpenList URL）。缺省：本地输入用同级 <name>__compressed；远端输入用同级 <name>__compressed 目录。",
     )
-    ap.add_argument("--inplace", action="store_true", help="原地替换（不推荐 WebDAV 多设备并发）")
+    ap.add_argument("--inplace", action="store_true", help="原地替换（不推荐远端多设备并发）")
 
     ap.add_argument("--container", choices=["mp4", "mkv", "auto"], default="auto")
     ap.add_argument("--faststart", action="store_true", default=True)
@@ -2088,12 +1993,17 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--archive-password", type=str, default=None)
 
-    # webdav
-    ap.add_argument("--webdav-user", type=str, default=None)
-    ap.add_argument("--webdav-pass", type=str, default=None)
-    ap.add_argument("--webdav-insecure", action="store_true")
-    ap.add_argument("--webdav-timeout", type=int, default=60)
-    ap.add_argument("--stream-remote", action="store_true", help="use remote URL directly as ffmpeg input (WebDAV)")
+    # openlist
+    ap.add_argument("--openlist-user", type=str, default=None)
+    ap.add_argument("--openlist-pass", type=str, default=None)
+    ap.add_argument("--openlist-otp", type=str, default=None)
+    ap.add_argument("--openlist-timeout", type=int, default=60)
+    ap.add_argument(
+        "--prefetch",
+        type=int,
+        default=0,
+        help="预取远端输入文件的并发数（仅远端输入；0 表示关闭）",
+    )
 
     # multi-device
     ap.add_argument("--device-id", type=str, default=None)
@@ -2121,31 +2031,46 @@ def main() -> None:
         except AttributeError:
             device_id = platform.node() or os.environ.get("COMPUTERNAME") or "unknown"
 
-    webdav_client: Optional[WebDAVClient] = None
+    remote_client: Optional[OpenListClientSync] = None
+    remote_base: Optional[str] = None
     if is_url(args.input) or (args.output and is_url(args.output)):
-        webdav_client = WebDAVClient(
-            args.webdav_user,
-            args.webdav_pass,
-            insecure=args.webdav_insecure,
-            timeout=args.webdav_timeout,
+        base_candidate = args.input if is_url(args.input) else args.output
+        remote_base, _ = parse_remote_location(base_candidate)
+        if not args.openlist_user or not args.openlist_pass:
+            log_err("ERROR: 远端操作需要 --openlist-user 与 --openlist-pass。")
+            sys.exit(2)
+        remote_client = OpenListClientSync(
+            remote_base,
+            args.openlist_user,
+            args.openlist_pass,
+            timeout=args.openlist_timeout,
+            otp_key=args.openlist_otp,
         )
+    # 同一服务器检查（目前仅支持单服务器）
+    if is_url(args.input) and args.output and is_url(args.output):
+        base_in, _ = parse_remote_location(args.input)
+        base_out, _ = parse_remote_location(args.output)
+        if base_in != base_out:
+            log_err("ERROR: 当前版本仅支持同一 OpenList 服务器的输入/输出。")
+            sys.exit(2)
 
     # 输入枚举
     input_is_remote = is_url(args.input)
     if input_is_remote:
-        if webdav_client is None:
-            log_err("ERROR: WebDAV 输入需要 WebDAV 客户端。")
+        if remote_client is None:
+            log_err("ERROR: OpenList 输入需要远端客户端。")
             sys.exit(2)
-        in_root_url, items = iter_webdav_inputs(webdav_client, args.input)
-        in_root_local = None
-        in_root_display = in_root_url
+        in_base, in_root_remote_path = parse_remote_location(args.input)
+        in_root_remote_path, items = iter_remote_inputs(remote_client, in_root_remote_path)
+        in_root_local: Optional[Path] = None
+        in_root_display = f"{in_base}{in_root_remote_path}"
     else:
         in_path = Path(args.input).expanduser().resolve()
         if not in_path.exists():
             log_err("ERROR: 输入路径不存在。")
             sys.exit(2)
         in_root_local, items = iter_local_inputs(in_path)
-        in_root_url = None
+        in_root_remote_path = None
         in_root_display = str(in_root_local)
 
     if not items:
@@ -2155,71 +2080,80 @@ def main() -> None:
     # 输出位置
     out_is_remote = False
     out_root_local: Optional[Path] = None
-    out_root_url: Optional[str] = None
+    out_root_remote_path: Optional[str] = None
+    out_root_display: Optional[str] = None
 
     if args.inplace:
         if input_is_remote:
             out_is_remote = True
-            out_root_url = in_root_url
+            out_root_remote_path = in_root_remote_path
+            out_root_display = f"{remote_base or ''}{out_root_remote_path or ''}"
         else:
             out_is_remote = False
             out_root_local = in_root_local
+            out_root_display = str(out_root_local)
     else:
         if args.output is None:
             if input_is_remote:
                 # 默认与本地一致：同级目录加 __compressed
-                assert in_root_url is not None
-                pu = urlparse(in_root_url)
-                path = pu.path
-                if path.endswith("/"):
-                    path = path[:-1]
-                parent, _, name = path.rpartition("/")
-                if parent == "" and path.startswith("/"):
-                    parent = ""
+                assert in_root_remote_path is not None
+                path = in_root_remote_path.rstrip("/")
+                parent, name = posixpath.split(path)
                 if name == "":
                     name = "__compressed"
                 else:
                     name = name + "__compressed"
-                new_path = f"{parent}/{name}/" if parent else f"/{name}/"
-                out_root_url = urlunparse((pu.scheme, pu.netloc, new_path, "", "", ""))
-                out_root_url = normalize_url(out_root_url)
+                new_path = f"{parent}/{name}" if parent else f"/{name}"
+                out_root_remote_path = new_path
                 out_is_remote = True
+                out_root_display = f"{remote_base or ''}{out_root_remote_path}"
             else:
                 assert in_root_local is not None
                 out_root_local = in_root_local.parent / (in_root_local.name + "__compressed")
                 out_root_local.mkdir(parents=True, exist_ok=True)
                 out_is_remote = False
+                out_root_display = str(out_root_local)
         else:
             if is_url(args.output):
                 out_is_remote = True
-                out_root_url = normalize_url(args.output)
-                if not out_root_url.endswith("/"):
-                    out_root_url += "/"
+                base_out, path_out = parse_remote_location(args.output)
+                if remote_client is None:
+                    remote_base = base_out
+                    remote_client = OpenListClientSync(
+                        base_out,
+                        args.openlist_user,
+                        args.openlist_pass,
+                        timeout=args.openlist_timeout,
+                        otp_key=args.openlist_otp,
+                    )
+                out_root_remote_path = path_out if path_out.endswith("/") else path_out
+                out_root_display = f"{base_out}{out_root_remote_path}"
             else:
                 out_is_remote = False
                 out_root_local = Path(args.output).expanduser().resolve()
                 out_root_local.mkdir(parents=True, exist_ok=True)
+                out_root_display = str(out_root_local)
 
     # state + locks
     if out_is_remote:
-        assert webdav_client is not None and out_root_url is not None
+        assert remote_client is not None and out_root_remote_path is not None
         state_backend = StateBackend(
-            local_path=None, remote_url=webdav_join(out_root_url, STATE_DEFAULT_NAME), client=webdav_client
+            local_path=None, remote_path=remote_join(out_root_remote_path, STATE_DEFAULT_NAME), client=remote_client
         )
         lock_backend = LockBackend(
             local_dir=None,
-            remote_dir_url=webdav_join(out_root_url, LOCKS_DIR_NAME) + "/",
-            client=webdav_client,
+            remote_dir_path=remote_join(out_root_remote_path, LOCKS_DIR_NAME),
+            client=remote_client,
             device_id=device_id,
             ttl_sec=args.lock_ttl,
             steal_stale=args.steal_stale_lock,
         )
     else:
         assert out_root_local is not None
-        state_backend = StateBackend(local_path=out_root_local / STATE_DEFAULT_NAME, remote_url=None, client=None)
+        state_backend = StateBackend(local_path=out_root_local / STATE_DEFAULT_NAME, remote_path=None, client=None)
         lock_backend = LockBackend(
             local_dir=out_root_local / LOCKS_DIR_NAME,
-            remote_dir_url=None,
+            remote_dir_path=None,
             client=None,
             device_id=device_id,
             ttl_sec=args.lock_ttl,
@@ -2241,9 +2175,35 @@ def main() -> None:
             continue
         todo.append(it)
 
+    # 远端预取
+    prefetch_dir: Optional[Path] = None
+    prefetch_futs: Dict[str, cf.Future[Tuple[bool, Optional[Path], str]]] = {}
+    prefetch_executor: Optional[cf.ThreadPoolExecutor] = None
+    if input_is_remote and args.prefetch > 0 and remote_client is not None and todo:
+        prefetch_dir = Path(tempfile.mkdtemp(prefix="shrink_prefetch_"))
+        prefetch_executor = cf.ThreadPoolExecutor(max_workers=args.prefetch)
+
+        def submit_prefetch(it: WorkItem) -> None:
+            if not it.is_remote or it.remote_path is None:
+                return
+
+            def _task() -> Tuple[bool, Optional[Path], str]:
+                try:
+                    target = prefetch_dir / it.rel
+                    ensure_parent(target)
+                    remote_client.download_to(it.remote_path, target)
+                    return True, target, ""
+                except Exception as e:
+                    return False, None, str(e)
+
+            prefetch_futs[it.rel] = prefetch_executor.submit(_task)
+
+        for it in todo[: args.prefetch]:
+            submit_prefetch(it)
+
     log(f"Input root: {in_root_display}")
     log(f"Total: {len(items)} | done: {done_cnt} | processing(active): {proc_cnt} | to-run: {len(todo)}")
-    log(f"Output: {'(inplace)' if args.inplace else (out_root_url or str(out_root_local))}")
+    log(f"Output: {'(inplace)' if args.inplace else (out_root_display or '')}")
     log(f"Device: {device_id} | lock ttl: {args.lock_ttl}s | steal stale: {'ON' if args.steal_stale_lock else 'OFF'}")
     log(f"Video encoder: {args.video_encoder} | Image codec: {args.image_codec}")
 
@@ -2251,6 +2211,7 @@ def main() -> None:
 
     def _sig(_s: int, _f: Any) -> None:
         stop_event.set()
+        raise KeyboardInterrupt()
 
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
@@ -2272,38 +2233,45 @@ def main() -> None:
             if not acquired:
                 return it, JobResult(True, "skip", f"lock failed: {reason}", None, None)
             safe_append("processing", it)
+            latest = coord.load_latest(force=True)
+            ent = latest.get(it.rel)
+            if ent and ent.status == "done" and ent.src_size == it.src_size and ent.src_mtime_ns == it.src_mtime_ns:
+                return it, JobResult(True, "skip", "already done by other device", None, ent.dst_rel)
 
         try:
-            with tempfile.TemporaryDirectory(prefix="shrink_in_") as td_in, tempfile.TemporaryDirectory(prefix="shrink_out_") as td_out:
+            with tempfile.TemporaryDirectory(prefix="shrink_in_", ignore_cleanup_errors=True) as td_in, tempfile.TemporaryDirectory(
+                prefix="shrink_out_", ignore_cleanup_errors=True
+            ) as td_out:
                 in_tmp_root = Path(td_in)
                 out_tmp_root = Path(td_out)
 
                 local_src = in_tmp_root / it.rel
                 ensure_parent(local_src)
 
-                use_stream = (
-                    args.stream_remote
-                    and it.is_remote
-                    and (not args.dry_run)
-                )
-
-                stream_url = it.src_url
-                if use_stream and webdav_client is not None and it.src_url is not None:
-                    pu = urlparse(it.src_url)
-                    if not pu.username and (args.webdav_user is not None or args.webdav_pass is not None):
-                        user = quote(args.webdav_user or "")
-                        pwd = quote(args.webdav_pass or "")
-                        auth = f"{user}:{pwd}@" if (user or pwd) else ""
-                        netloc = auth + (pu.netloc or "")
-                        stream_url = urlunparse((pu.scheme, netloc, pu.path, pu.params, pu.query, pu.fragment))
-
-                if it.is_remote and not use_stream:
-                    assert webdav_client is not None and it.src_url is not None
-                    r = webdav_client.get_bytes(it.src_url)
-                    if r[0].status >= 400:
-                        return it, JobResult(False, "fail", f"download failed {r[0].status} {r[0].reason}")
-                    local_src.write_bytes(r[1])
-                elif not it.is_remote:
+                if it.is_remote:
+                    assert remote_client is not None and it.remote_path is not None
+                    fut = prefetch_futs.get(it.rel) if prefetch_futs else None
+                    if fut is not None:
+                        try:
+                            ok_dl, path_dl, err = fut.result()
+                        except Exception as e:
+                            return it, JobResult(False, "fail", f"prefetch failed: {e}")
+                        if not ok_dl or path_dl is None:
+                            return it, JobResult(False, "fail", f"prefetch failed: {err}")
+                        try:
+                            ensure_parent(local_src)
+                            shutil.copy2(path_dl, local_src)
+                            if size_of(local_src) != it.src_size:
+                                # size changed or partial; re-download latest
+                                remote_client.download_to(it.remote_path, local_src)
+                        except Exception as e:
+                            return it, JobResult(False, "fail", f"prefetch copy failed: {e}")
+                    else:
+                        try:
+                            remote_client.download_to(it.remote_path, local_src)
+                        except Exception as e:
+                            return it, JobResult(False, "fail", f"download failed: {e}")
+                else:
                     assert it.src_local is not None
                     if not args.dry_run:
                         shutil.copy2(it.src_local, local_src)
@@ -2336,11 +2304,8 @@ def main() -> None:
                     comic_keep_non_images=args.comic_keep_non_images,
                     comic_accept_bigger=args.comic_accept_bigger,
                     archive_password=args.archive_password,
-                    src_url=stream_url,
                     rel_override=it.rel,
                     src_size_hint=it.src_size,
-                    allow_remote_stream=use_stream,
-                    webdav_client=webdav_client,
                 )
 
                 if args.dry_run:
@@ -2350,11 +2315,14 @@ def main() -> None:
                     return it, jr
 
                 if out_is_remote:
-                    assert webdav_client is not None and out_root_url is not None
+                    assert remote_client is not None and out_root_remote_path is not None
                     if jr.out_local is None or jr.out_rel is None:
                         return it, JobResult(True, "skip", "no output generated")
-                    dst_url = webdav_join(out_root_url, jr.out_rel)
-                    upload_file_webdav(webdav_client, jr.out_local, dst_url, overwrite=args.overwrite)
+                    dst_path = remote_join(out_root_remote_path, jr.out_rel)
+                    try:
+                        upload_file_remote(remote_client, jr.out_local, dst_path, overwrite=args.overwrite)
+                    except Exception as e:
+                        return it, JobResult(False, "fail", f"upload failed: {e}")
                     return it, JobResult(True, jr.action, jr.msg, None, jr.out_rel)
 
                 return it, jr
@@ -2396,8 +2364,14 @@ def main() -> None:
             for it in todo:
                 if stop_event.is_set():
                     break
-                it2, jr = worker(it)
-                finalize(it2, jr)
+                try:
+                    it2, jr = worker(it)
+                    finalize(it2, jr)
+                except Exception as e:
+                    failed += 1
+                    log_err(f"[FAIL] worker exception: {e}")
+                    if not args.dry_run:
+                        safe_append("fail", it, dst_rel=None)
         else:
             with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
                 it_iter = iter(todo)
@@ -2417,30 +2391,48 @@ def main() -> None:
                     if not submit_next():
                         break
 
-                while futures:
-                    done, _ = cf.wait(futures.keys(), return_when=cf.FIRST_COMPLETED)
+                while futures and not stop_event.is_set():
+                    done, _ = cf.wait(futures.keys(), timeout=0.5, return_when=cf.FIRST_COMPLETED)
+                    if not done:
+                        continue
                     for fut in done:
-                        futures.pop(fut, None)
+                        it_ref = futures.pop(fut, None)
                         try:
                             it2, jr = fut.result()
                         except Exception as e:
                             failed += 1
                             log_err(f"[FAIL] worker exception: {e}")
+                            if it_ref is not None and not args.dry_run:
+                                safe_append("fail", it_ref, dst_rel=None)
                             continue
                         finalize(it2, jr)
                         if not stop_event.is_set():
                             submit_next()
 
-                    if stop_event.is_set():
-                        for fut in list(futures.keys()):
-                            fut.cancel()
-                        break
+                if stop_event.is_set():
+                    for fut in list(futures.keys()):
+                        fut.cancel()
+                    ex.shutdown(wait=False, cancel_futures=True)
 
     except KeyboardInterrupt:
         stop_event.set()
 
     if stop_event.is_set():
         log("\nInterrupted. done 已写入 state；processing 会保留并在 TTL 超时后可被接管。")
+
+    if prefetch_executor is not None:
+        prefetch_executor.shutdown(wait=False, cancel_futures=True)
+    if prefetch_dir is not None:
+        try:
+            shutil.rmtree(prefetch_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    if remote_client is not None:
+        try:
+            remote_client.close()
+        except Exception:
+            pass
 
     log(f"\nSummary: OK={ok}, SKIP/COPY={skipped}, FAIL={failed}")
     if failed:
