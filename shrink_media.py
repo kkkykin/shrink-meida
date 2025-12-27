@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import concurrent.futures as cf
 import hashlib
 import json
@@ -43,7 +44,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, TextIO, Tuple
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -73,12 +74,55 @@ LOCKS_DIR_NAME = ".shrink_media_locks"
 # 简易日志
 # ------------------------
 
+_LOG_FH: Optional[TextIO] = None
+_LOG_LOCK = threading.Lock()
+
+
+def configure_logging(log_file: Optional[str], *, append: bool) -> None:
+    global _LOG_FH
+    if not log_file:
+        return
+    p = Path(log_file)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if append else "w"
+    try:
+        _LOG_FH = p.open(mode, encoding="utf-8", errors="replace")
+    except Exception as e:
+        log_err(f"ERROR: cannot open --log-file {p}: {e}")
+        sys.exit(2)
+
+    def _close() -> None:
+        global _LOG_FH
+        if _LOG_FH is None:
+            return
+        try:
+            _LOG_FH.flush()
+        except Exception:
+            pass
+        try:
+            _LOG_FH.close()
+        except Exception:
+            pass
+        _LOG_FH = None
+
+    atexit.register(_close)
+
+
+def _write_log_line(msg: str, *, is_err: bool) -> None:
+    if _LOG_FH is None:
+        print(msg, file=(sys.stderr if is_err else sys.stdout), flush=True)
+        return
+    with _LOG_LOCK:
+        _LOG_FH.write(msg + "\n")
+        _LOG_FH.flush()
+
+
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    _write_log_line(msg, is_err=False)
 
 
 def log_err(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    _write_log_line(msg, is_err=True)
 
 
 # ------------------------
@@ -2138,6 +2182,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--archive-password", type=str, default=None)
     ap.add_argument("--debug", action="store_true", help="verbose debug logging for pipeline, locks, IO")
     ap.add_argument("--prefetch-debug", action="store_true", help="log detailed prefetch events")
+    ap.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="将所有日志写入文件（替代 stdout/stderr）",
+    )
+    ap.add_argument("--log-append", action="store_true", help="追加写入 --log-file（默认覆盖）")
 
     # openlist
     ap.add_argument("--openlist-user", type=str, default=None)
@@ -2167,6 +2218,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    configure_logging(args.log_file, append=args.log_append)
     # --help 已在 parse_args 内提前退出；放在这里确保显示帮助不依赖外部工具
     require_tools()
 
