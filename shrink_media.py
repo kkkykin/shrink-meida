@@ -43,7 +43,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -1992,6 +1992,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--comic-no-accept-bigger", dest="comic_accept_bigger", action="store_false")
 
     ap.add_argument("--archive-password", type=str, default=None)
+    ap.add_argument("--debug", action="store_true", help="verbose debug logging for pipeline, locks, IO")
+    ap.add_argument("--prefetch-debug", action="store_true", help="log detailed prefetch events")
 
     # openlist
     ap.add_argument("--openlist-user", type=str, default=None)
@@ -2175,13 +2177,33 @@ def main() -> None:
             continue
         todo.append(it)
 
+    def dbg(msg: str) -> None:
+        if args.debug:
+            log(f"[DEBUG] {msg}")
+
+    def pdebug(msg: str) -> None:
+        if args.prefetch_debug or args.debug:
+            log(f"[PREFETCH] {msg}")
+
     # 远端预取
     prefetch_dir: Optional[Path] = None
     prefetch_futs: Dict[str, cf.Future[Tuple[bool, Optional[Path], str]]] = {}
+    prefetch_results: Dict[str, Tuple[bool, Optional[Path], str]] = {}
+    # Worker 选择直接 fut.result() 等待该条目时，用于阻止回调把结果塞进 prefetch_results
+    # （否则会留下永远不被消费的 cached，导致 pump_prefetch() 因 cached>0 长期停摆）
+    prefetch_claimed: set[str] = set()
     prefetch_executor: Optional[cf.ThreadPoolExecutor] = None
+    prefetch_iter: Optional[Iterator[WorkItem]] = None
+    prefetch_mu = threading.Lock()
+
+    def pump_prefetch() -> None:
+        return
+
     if input_is_remote and args.prefetch > 0 and remote_client is not None and todo:
         prefetch_dir = Path(tempfile.mkdtemp(prefix="shrink_prefetch_"))
+        dbg(f"prefetch dir: {prefetch_dir}")
         prefetch_executor = cf.ThreadPoolExecutor(max_workers=args.prefetch)
+        prefetch_iter = iter([it for it in todo if it.is_remote])
 
         def submit_prefetch(it: WorkItem) -> None:
             if not it.is_remote or it.remote_path is None:
@@ -2196,10 +2218,56 @@ def main() -> None:
                 except Exception as e:
                     return False, None, str(e)
 
-            prefetch_futs[it.rel] = prefetch_executor.submit(_task)
+            fut = prefetch_executor.submit(_task)
+            with prefetch_mu:
+                prefetch_futs[it.rel] = fut
+            pdebug(f"queued {it.rel}")
 
-        for it in todo[: args.prefetch]:
-            submit_prefetch(it)
+            def _done(f: cf.Future) -> None:
+                try:
+                    res = f.result()
+                except Exception as e:
+                    res = (False, None, str(e))
+                with prefetch_mu:
+                    prefetch_futs.pop(it.rel, None)
+                    claimed = it.rel in prefetch_claimed
+                    prefetch_claimed.discard(it.rel)
+                    if not claimed:
+                        prefetch_results[it.rel] = res
+                ok_dl, path_dl, err = res
+                if ok_dl:
+                    pdebug(f"done {it.rel} size={path_dl.stat().st_size if path_dl and path_dl.exists() else 'n/a'}")
+                else:
+                    pdebug(f"fail {it.rel}: {err}")
+                pump_prefetch()
+
+            fut.add_done_callback(_done)
+
+        def pump_prefetch() -> None:
+            if prefetch_executor is None or prefetch_iter is None:
+                return
+            while True:
+                with prefetch_mu:
+                    running = len(prefetch_futs)
+                    cached = len(prefetch_results)
+                pdebug(f"pump running={running} cached={cached}")
+                # Only count running ones toward the window, but don't start if a cached
+                # result exists for a different item to avoid blowing through the list.
+                # Start next only when there is no cached item pending consumption.
+                if running >= args.prefetch or cached > 0:
+                    pdebug(f"window hold (running={running}, cached={cached})")
+                    break
+                try:
+                    nxt = next(prefetch_iter)
+                except StopIteration:
+                    pdebug("no more to prefetch")
+                    break
+                if not nxt.is_remote or nxt.remote_path is None:
+                    continue
+                pdebug(f"dequeue {nxt.rel}")
+                submit_prefetch(nxt)
+
+        pump_prefetch()
 
     log(f"Input root: {in_root_display}")
     log(f"Total: {len(items)} | done: {done_cnt} | processing(active): {proc_cnt} | to-run: {len(todo)}")
@@ -2227,15 +2295,19 @@ def main() -> None:
             log_err(f"[WARN] state append failed ({status}) for {it.rel}: {e}")
 
     def worker(it: WorkItem) -> Tuple[WorkItem, JobResult]:
+        dbg(f"start {it.rel} remote={it.is_remote} size={it.src_size}")
         # lock
         if not args.dry_run:
             acquired, reason = coord.locks.try_acquire(it.rel)
             if not acquired:
+                dbg(f"lock skip {it.rel}: {reason}")
                 return it, JobResult(True, "skip", f"lock failed: {reason}", None, None)
+            dbg(f"lock ok {it.rel}")
             safe_append("processing", it)
             latest = coord.load_latest(force=True)
             ent = latest.get(it.rel)
             if ent and ent.status == "done" and ent.src_size == it.src_size and ent.src_mtime_ns == it.src_mtime_ns:
+                dbg(f"already done elsewhere {it.rel}")
                 return it, JobResult(True, "skip", "already done by other device", None, ent.dst_rel)
 
         try:
@@ -2250,30 +2322,54 @@ def main() -> None:
 
                 if it.is_remote:
                     assert remote_client is not None and it.remote_path is not None
-                    fut = prefetch_futs.get(it.rel) if prefetch_futs else None
-                    if fut is not None:
+                    res: Optional[Tuple[bool, Optional[Path], str]] = None
+                    fut: Optional[cf.Future[Tuple[bool, Optional[Path], str]]] = None
+                    with prefetch_mu:
+                        res = prefetch_results.pop(it.rel, None)
+                        fut = prefetch_futs.get(it.rel)
+                        if res is None and fut is not None:
+                            prefetch_claimed.add(it.rel)
+                    if res is None and fut is not None:
                         try:
-                            ok_dl, path_dl, err = fut.result()
+                            res = fut.result()
                         except Exception as e:
-                            return it, JobResult(False, "fail", f"prefetch failed: {e}")
-                        if not ok_dl or path_dl is None:
-                            return it, JobResult(False, "fail", f"prefetch failed: {err}")
-                        try:
-                            ensure_parent(local_src)
-                            shutil.copy2(path_dl, local_src)
-                            if size_of(local_src) != it.src_size:
-                                # size changed or partial; re-download latest
+                            res = (False, None, str(e))
+                    # after consuming any cached/active prefetch, allow queue refill
+                    pump_prefetch()
+                    if res is not None:
+                        ok_dl, path_dl, err = res
+                        if args.prefetch_debug:
+                            pdebug(f"use {'hit' if ok_dl else 'miss'} {it.rel}")
+                        if ok_dl and path_dl is not None:
+                            try:
+                                ensure_parent(local_src)
+                                dbg(f"prefetch copy {path_dl} -> {local_src}")
+                                shutil.copy2(path_dl, local_src)
+                                if size_of(local_src) != it.src_size:
+                                    dbg(f"size mismatch; re-download {it.remote_path}")
+                                    remote_client.download_to(it.remote_path, local_src)
+                                try:
+                                    path_dl.unlink(missing_ok=True)  # cleanup consumed prefetch
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                return it, JobResult(False, "fail", f"prefetch copy failed: {e}")
+                        else:
+                            try:
+                                dbg(f"prefetch miss -> download {it.remote_path}")
                                 remote_client.download_to(it.remote_path, local_src)
-                        except Exception as e:
-                            return it, JobResult(False, "fail", f"prefetch copy failed: {e}")
+                            except Exception as e:
+                                return it, JobResult(False, "fail", f"prefetch+download failed: {err or e}")
                     else:
                         try:
+                            dbg(f"download {it.remote_path} -> {local_src}")
                             remote_client.download_to(it.remote_path, local_src)
                         except Exception as e:
                             return it, JobResult(False, "fail", f"download failed: {e}")
                 else:
                     assert it.src_local is not None
                     if not args.dry_run:
+                        dbg(f"local copy {it.src_local} -> {local_src}")
                         shutil.copy2(it.src_local, local_src)
 
                 local_out_root = out_tmp_root if out_is_remote else out_root_local  # type: ignore
@@ -2320,6 +2416,7 @@ def main() -> None:
                         return it, JobResult(True, "skip", "no output generated")
                     dst_path = remote_join(out_root_remote_path, jr.out_rel)
                     try:
+                        dbg(f"upload {jr.out_local} -> {dst_path}")
                         upload_file_remote(remote_client, jr.out_local, dst_path, overwrite=args.overwrite)
                     except Exception as e:
                         return it, JobResult(False, "fail", f"upload failed: {e}")
@@ -2424,6 +2521,7 @@ def main() -> None:
         prefetch_executor.shutdown(wait=False, cancel_futures=True)
     if prefetch_dir is not None:
         try:
+            dbg(f"cleanup prefetch dir {prefetch_dir}")
             shutil.rmtree(prefetch_dir, ignore_errors=True)
         except Exception:
             pass
