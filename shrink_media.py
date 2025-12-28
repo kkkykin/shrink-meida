@@ -68,6 +68,7 @@ TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt"}
 BITMAP_SUB_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub", "vobsub"}
 
 STATE_DEFAULT_NAME = ".shrink_media_state.jsonl"
+STATE_DIR_NAME = ".shrink_media_state"
 LOCKS_DIR_NAME = ".shrink_media_locks"
 
 # ------------------------
@@ -175,7 +176,7 @@ def looks_like_archive_name(name: str) -> bool:
 
 
 def should_ignore_name(name: str) -> bool:
-    if name in {STATE_DEFAULT_NAME, LOCKS_DIR_NAME}:
+    if name in {STATE_DEFAULT_NAME, STATE_DIR_NAME, LOCKS_DIR_NAME}:
         return True
     if ".__tmp__" in name:
         return True
@@ -577,6 +578,8 @@ def iter_local_inputs(input_path: Path) -> Tuple[Path, List[WorkItem]]:
         if should_ignore_name(p.name):
             continue
         rel = p.relative_to(root).as_posix()
+        if rel.startswith(LOCKS_DIR_NAME + "/") or rel.startswith(STATE_DIR_NAME + "/"):
+            continue
         st = p.stat()
         items.append(
             WorkItem(
@@ -598,7 +601,7 @@ def iter_remote_inputs(client: OpenListClientSync, root_path: str) -> Tuple[str,
         name = Path(e.rel).name
         if should_ignore_name(name):
             continue
-        if e.rel.startswith(LOCKS_DIR_NAME + "/"):
+        if e.rel.startswith(LOCKS_DIR_NAME + "/") or e.rel.startswith(STATE_DIR_NAME + "/"):
             continue
         items.append(
             WorkItem(
@@ -628,10 +631,10 @@ class StateEntry:
     dst_rel: Optional[str] = None
 
 
-class StateBackend:
+class StateBackendJsonl:
     """
-    - 本地：直接 append
-    - OpenList：读现有文本，追加后整文件覆盖
+    - 本地：单文件 JSONL，append 写入（历史保留）。
+    - OpenList：单文件 JSONL 只能通过“读旧文本 + 覆盖上传”模拟 append，存在并发丢行风险（不建议）。
     """
 
     def __init__(self, *, local_path: Optional[Path], remote_path: Optional[str], client: Optional[OpenListClientSync]) -> None:
@@ -640,7 +643,7 @@ class StateBackend:
         self.client = client
         self._append_mu = threading.Lock()
         if (local_path is None) == (remote_path is None):
-            raise ValueError("StateBackend needs exactly one of local_path or remote_path")
+            raise ValueError("StateBackendJsonl needs exactly one of local_path or remote_path")
 
     def read_all(self) -> str:
         if self.local_path is not None:
@@ -696,6 +699,148 @@ class StateBackend:
                     self.client.listdir(parent, refresh=True, per_page=1)
                 except Exception:
                     pass
+
+
+class StateBackendPerFile:
+    """
+    OpenList：每个 src_rel 单独一个 state 文件，避免单文件 JSONL 的“读旧+覆盖”并发丢行。
+
+    Layout:
+    - <state_dir>/<prefix>/<sha1(src_rel)>.json
+    """
+
+    def __init__(self, *, remote_dir_path: str, client: OpenListClientSync, legacy_jsonl_path: Optional[str] = None) -> None:
+        self.remote_dir_path = remote_dir_path.rstrip("/") or "/"
+        self.client = client
+        self.legacy_jsonl_path = legacy_jsonl_path
+        self._ensured_dirs: set[str] = set()
+        self._mu = threading.Lock()
+        self._legacy_cache: Dict[str, StateEntry] = {}
+        self._legacy_cache_at = 0.0
+        self._ensure_dir(self.remote_dir_path)
+
+    def _ensure_dir(self, path: str) -> None:
+        with self._mu:
+            if path in self._ensured_dirs:
+                return
+            self._ensured_dirs.add(path)
+        self.client.ensure_dir(path)
+
+    def _path_for_rel(self, rel: str) -> Tuple[str, str]:
+        token = sha1_hex(rel)
+        prefix = token[:2]
+        parent = remote_join(self.remote_dir_path, prefix)
+        p = remote_join(self.remote_dir_path, f"{prefix}/{token}.json")
+        return parent, p
+
+    def _load_legacy_latest(self, *, force: bool = False) -> Dict[str, StateEntry]:
+        if not self.legacy_jsonl_path:
+            return {}
+        with self._mu:
+            if not force and self._legacy_cache and (time.time() - self._legacy_cache_at) < 10:
+                return self._legacy_cache
+        try:
+            txt = self.client.read_text(self.legacy_jsonl_path)
+        except FileNotFoundError:
+            txt = ""
+        except Exception:
+            txt = ""
+        latest: Dict[str, StateEntry] = {}
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            rel = obj.get("src_rel")
+            st = obj.get("status")
+            if not isinstance(rel, str) or not isinstance(st, str):
+                continue
+            try:
+                ent = StateEntry(
+                    ts=float(obj.get("ts", 0)),
+                    status=st,
+                    device_id=str(obj.get("device_id", "")),
+                    src_rel=rel,
+                    src_size=int(obj.get("src_size", 0)),
+                    src_mtime_ns=int(obj.get("src_mtime_ns", 0)),
+                    dst_rel=obj.get("dst_rel"),
+                )
+            except Exception:
+                continue
+            prev = latest.get(rel)
+            if prev is None or ent.ts >= prev.ts:
+                latest[rel] = ent
+        with self._mu:
+            self._legacy_cache = latest
+            self._legacy_cache_at = time.time()
+        return latest
+
+    def read_latest(self, rel: str) -> Optional[StateEntry]:
+        _parent, p = self._path_for_rel(rel)
+        try:
+            txt = self.client.read_text(p)
+        except FileNotFoundError:
+            ent = self._load_legacy_latest().get(rel)
+            # 懒迁移：把 legacy 单文件 JSONL 的最新记录写入 per-file state，降低后续对 legacy 的依赖。
+            if ent is not None and ent.status == "done":
+                try:
+                    self.write_latest(ent)
+                except Exception:
+                    pass
+            return ent
+        except Exception:
+            return None
+        try:
+            obj = json.loads(txt or "{}")
+        except Exception:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        st = obj.get("status")
+        if not isinstance(st, str):
+            return None
+        try:
+            ent = StateEntry(
+                ts=float(obj.get("ts", 0)),
+                status=st,
+                device_id=str(obj.get("device_id", "")),
+                src_rel=str(obj.get("src_rel", rel)),
+                src_size=int(obj.get("src_size", 0)),
+                src_mtime_ns=int(obj.get("src_mtime_ns", 0)),
+                dst_rel=obj.get("dst_rel"),
+            )
+        except Exception:
+            return None
+        if ent.src_rel != rel:
+            return None
+        return ent
+
+    def write_latest(self, ent: StateEntry) -> None:
+        parent, p = self._path_for_rel(ent.src_rel)
+        self._ensure_dir(parent)
+        payload = json.dumps(
+            {
+                "ts": ent.ts,
+                "status": ent.status,
+                "device_id": ent.device_id,
+                "src_rel": ent.src_rel,
+                "src_size": ent.src_size,
+                "src_mtime_ns": ent.src_mtime_ns,
+                "dst_rel": ent.dst_rel,
+            },
+            ensure_ascii=False,
+        )
+        self.client.upload_text(p, payload, overwrite=True)
+        # OpenList 服务端偶尔不会立即刷新文件变更；触发一次 listdir(refresh=True) 提示它更新。
+        try:
+            self.client.listdir(parent, refresh=True, per_page=1)
+        except Exception:
+            pass
 
 
 class LockBackend:
@@ -860,22 +1005,26 @@ class LockBackend:
 
 
 class Coordinator:
-    def __init__(self, state: StateBackend, locks: LockBackend, *, device_id: str, ttl_sec: int) -> None:
+    def __init__(self, state: StateBackendJsonl | StateBackendPerFile, locks: LockBackend, *, device_id: str, ttl_sec: int) -> None:
         self.state = state
         self.locks = locks
         self.device_id = device_id
         self.ttl_sec = ttl_sec
-        self._cache: Dict[str, StateEntry] = {}
-        self._cache_at = 0.0
+        self._cache_map: Dict[str, StateEntry] = {}
+        self._cache_map_at = 0.0
+        self._cache_one: Dict[str, Optional[StateEntry]] = {}
+        self._cache_one_at: Dict[str, float] = {}
         self._mu = threading.Lock()
 
     def _now(self) -> float:
         return time.time()
 
-    def load_latest(self, *, force: bool = False) -> Dict[str, StateEntry]:
+    def _load_latest_map(self, *, force: bool = False) -> Dict[str, StateEntry]:
+        if not isinstance(self.state, StateBackendJsonl):
+            return {}
         with self._mu:
-            if not force and self._cache and (self._now() - self._cache_at < 10):
-                return self._cache
+            if not force and self._cache_map and (self._now() - self._cache_map_at < 10):
+                return self._cache_map
 
             txt = self.state.read_all()
             latest: Dict[str, StateEntry] = {}
@@ -909,12 +1058,28 @@ class Coordinator:
                 if prev is None or ent.ts >= prev.ts:
                     latest[rel] = ent
 
-            self._cache = latest
-            self._cache_at = self._now()
+            self._cache_map = latest
+            self._cache_map_at = self._now()
             return latest
 
+    def get_latest(self, rel: str, *, force: bool = False) -> Optional[StateEntry]:
+        if isinstance(self.state, StateBackendJsonl):
+            return self._load_latest_map(force=force).get(rel)
+
+        now = self._now()
+        with self._mu:
+            if not force:
+                at = self._cache_one_at.get(rel)
+                if at and (now - at) < 10:
+                    return self._cache_one.get(rel)
+        ent = self.state.read_latest(rel)
+        with self._mu:
+            self._cache_one[rel] = ent
+            self._cache_one_at[rel] = now
+        return ent
+
     def is_done(self, it: WorkItem) -> bool:
-        ent = self.load_latest().get(it.rel)
+        ent = self.get_latest(it.rel)
         if not ent:
             return False
         if ent.status != "done":
@@ -922,7 +1087,7 @@ class Coordinator:
         return ent.src_size == it.src_size and ent.src_mtime_ns == it.src_mtime_ns
 
     def is_processing(self, it: WorkItem, *, current_device_id: Optional[str] = None) -> bool:
-        ent = self.load_latest().get(it.rel)
+        ent = self.get_latest(it.rel)
         if not ent:
             return False
         if ent.status != "processing":
@@ -939,27 +1104,36 @@ class Coordinator:
             return False
 
     def append(self, status: str, it: WorkItem, *, dst_rel: Optional[str] = None) -> None:
-        rec = {
-            "ts": self._now(),
-            "status": status,
-            "device_id": self.device_id,
-            "src_rel": it.rel,
-            "src_size": it.src_size,
-            "src_mtime_ns": it.src_mtime_ns,
-            "dst_rel": dst_rel,
-        }
-        self.state.append_line(json.dumps(rec, ensure_ascii=False))
+        ts = self._now()
+        ent = StateEntry(
+            ts=ts,
+            status=status,
+            device_id=self.device_id,
+            src_rel=it.rel,
+            src_size=it.src_size,
+            src_mtime_ns=it.src_mtime_ns,
+            dst_rel=dst_rel,
+        )
+        if isinstance(self.state, StateBackendJsonl):
+            rec = {
+                "ts": ts,
+                "status": status,
+                "device_id": self.device_id,
+                "src_rel": it.rel,
+                "src_size": it.src_size,
+                "src_mtime_ns": it.src_mtime_ns,
+                "dst_rel": dst_rel,
+            }
+            self.state.append_line(json.dumps(rec, ensure_ascii=False))
+        else:
+            self.state.write_latest(ent)
         with self._mu:
-            self._cache[it.rel] = StateEntry(
-                ts=float(rec["ts"]),
-                status=status,
-                device_id=self.device_id,
-                src_rel=it.rel,
-                src_size=it.src_size,
-                src_mtime_ns=it.src_mtime_ns,
-                dst_rel=dst_rel,
-            )
-            self._cache_at = self._now()
+            if isinstance(self.state, StateBackendJsonl):
+                self._cache_map[it.rel] = ent
+                self._cache_map_at = self._now()
+            else:
+                self._cache_one[it.rel] = ent
+                self._cache_one_at[it.rel] = self._now()
 
 
 # ------------------------
@@ -2345,8 +2519,10 @@ def main() -> None:
     # state + locks
     if out_is_remote:
         assert remote_client is not None and out_root_remote_path is not None
-        state_backend = StateBackend(
-            local_path=None, remote_path=remote_join(out_root_remote_path, STATE_DEFAULT_NAME), client=remote_client
+        state_backend = StateBackendPerFile(
+            remote_dir_path=remote_join(out_root_remote_path, STATE_DIR_NAME),
+            client=remote_client,
+            legacy_jsonl_path=remote_join(out_root_remote_path, STATE_DEFAULT_NAME),
         )
         lock_backend = LockBackend(
             local_dir=None,
@@ -2358,7 +2534,7 @@ def main() -> None:
         )
     else:
         assert out_root_local is not None
-        state_backend = StateBackend(local_path=out_root_local / STATE_DEFAULT_NAME, remote_path=None, client=None)
+        state_backend = StateBackendJsonl(local_path=out_root_local / STATE_DEFAULT_NAME, remote_path=None, client=None)
         lock_backend = LockBackend(
             local_dir=out_root_local / LOCKS_DIR_NAME,
             remote_dir_path=None,
@@ -2567,8 +2743,7 @@ def main() -> None:
                 lock_acquired = True
 
                 # 重新拉取最新 state（避免 todo 构建时的缓存导致重复处理）
-                latest = coord.load_latest(force=True)
-                ent = latest.get(it.rel)
+                ent = coord.get_latest(it.rel, force=True)
                 if ent and ent.status == "done" and ent.src_size == it.src_size and ent.src_mtime_ns == it.src_mtime_ns:
                     dbg(f"already done elsewhere {it.rel}")
                     return StageResult(it, JobResult(True, "skip", "already done by other device", None, ent.dst_rel))
