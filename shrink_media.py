@@ -34,6 +34,7 @@ import os
 import platform
 import posixpath
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -2081,6 +2082,16 @@ def process_one_local(
 
     # comic/archive
     if info.kind == "comic":
+        if not try_archives:
+            dst = out_root / rel
+            if dry_run:
+                return JobResult(True, "dry-run", "comic try disabled -> would copy", None, rel)
+            err = ensure_local()
+            if err:
+                return JobResult(False, "fail", err)
+            copy_file_local(src_local, dst, overwrite=overwrite)
+            return JobResult(True, "copy", "comic copied (try disabled)", dst, rel)
+
         err = ensure_local()
         if err:
             return JobResult(False, "fail", err)
@@ -2308,9 +2319,40 @@ def process_one_local(
 # CLI / main
 # ------------------------
 
-def parse_args() -> argparse.Namespace:
+def _env_nonempty(key: str) -> Optional[str]:
+    v = os.environ.get(key)
+    if v is None:
+        return None
+    v = v.strip()
+    return v if v else None
+
+
+def _env_argv() -> List[str]:
+    js = _env_nonempty("SHRINK_MEDIA_ARGV_JSON")
+    if js:
+        try:
+            v = json.loads(js)
+        except Exception as e:
+            log_err(f"ERROR: invalid JSON in SHRINK_MEDIA_ARGV_JSON: {e}")
+            sys.exit(2)
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            log_err("ERROR: SHRINK_MEDIA_ARGV_JSON must be a JSON array of strings.")
+            sys.exit(2)
+        return [str(x) for x in v]
+
+    s = _env_nonempty("SHRINK_MEDIA_ARGS")
+    if not s:
+        return []
+    try:
+        return shlex.split(s)
+    except ValueError as e:
+        log_err(f"ERROR: invalid SHRINK_MEDIA_ARGS (shell-like string): {e}")
+        sys.exit(2)
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="shrink_media: local/OpenList + multi-device state+locks")
-    ap.add_argument("input", type=str, help="输入（本地路径或 OpenList URL）")
+    ap.add_argument("input", type=str, nargs="?", default=None, help="输入（本地路径或 OpenList URL）")
     ap.add_argument(
         "-o",
         "--output",
@@ -2372,7 +2414,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--openlist-user", type=str, default=None)
     ap.add_argument("--openlist-pass", type=str, default=None)
     ap.add_argument("--openlist-otp", type=str, default=None)
-    ap.add_argument("--openlist-timeout", type=int, default=60)
+    ap.add_argument("--openlist-timeout", type=int, default=None)
     ap.add_argument(
         "--prefetch",
         type=int,
@@ -2391,7 +2433,42 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lock-ttl", type=int, default=6 * 3600)
     ap.add_argument("--no-steal-stale-lock", dest="steal_stale_lock", action="store_false", default=True)
 
-    return ap.parse_args()
+    cli_argv = sys.argv[1:] if argv is None else argv
+    env_argv = _env_argv()
+    args = ap.parse_args(env_argv + cli_argv)
+
+    # 从环境变量补齐常用参数（命令行优先）。
+    if args.input is None:
+        args.input = _env_nonempty("SHRINK_MEDIA_INPUT")
+    if args.output is None:
+        args.output = _env_nonempty("SHRINK_MEDIA_OUTPUT")
+
+    if args.openlist_user is None:
+        args.openlist_user = _env_nonempty("SHRINK_MEDIA_OPENLIST_USER") or _env_nonempty("OPENLIST_USER")
+    if args.openlist_pass is None:
+        args.openlist_pass = _env_nonempty("SHRINK_MEDIA_OPENLIST_PASS") or _env_nonempty("OPENLIST_PASS")
+    if args.openlist_otp is None:
+        args.openlist_otp = _env_nonempty("SHRINK_MEDIA_OPENLIST_OTP") or _env_nonempty("OPENLIST_OTP")
+    if args.openlist_timeout is None:
+        t = _env_nonempty("SHRINK_MEDIA_OPENLIST_TIMEOUT") or _env_nonempty("OPENLIST_TIMEOUT")
+        if t:
+            try:
+                args.openlist_timeout = int(t)
+            except ValueError:
+                ap.error("Invalid OPENLIST_TIMEOUT/SHRINK_MEDIA_OPENLIST_TIMEOUT: must be int seconds.")
+        else:
+            args.openlist_timeout = 60
+
+    if args.archive_password is None:
+        args.archive_password = _env_nonempty("SHRINK_MEDIA_ARCHIVE_PASSWORD") or _env_nonempty("ARCHIVE_PASSWORD")
+
+    if args.device_id is None:
+        args.device_id = _env_nonempty("SHRINK_MEDIA_DEVICE_ID") or _env_nonempty("DEVICE_ID")
+
+    if args.input is None:
+        ap.error("Missing input: provide positional `input` or set env `SHRINK_MEDIA_INPUT`.")
+
+    return args
 
 
 def main() -> None:
