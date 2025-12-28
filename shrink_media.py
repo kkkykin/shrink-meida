@@ -638,6 +638,7 @@ class StateBackend:
         self.local_path = local_path
         self.remote_path = remote_path
         self.client = client
+        self._append_mu = threading.Lock()
         if (local_path is None) == (remote_path is None):
             raise ValueError("StateBackend needs exactly one of local_path or remote_path")
 
@@ -656,42 +657,45 @@ class StateBackend:
             return ""
 
     def append_line(self, line: str) -> None:
-        if self.local_path is not None:
-            ensure_parent(self.local_path)
-            with self.local_path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-                f.flush()
-            return
+        # OpenList 的“读旧文本 + 覆盖上传”不是原子 append：并发写会丢行。
+        # 这里至少保证“单进程内”串行 append，降低丢失 done 的概率。
+        with self._append_mu:
+            if self.local_path is not None:
+                ensure_parent(self.local_path)
+                with self.local_path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+                    f.flush()
+                return
 
-        assert self.client is not None and self.remote_path is not None
-        # ensure remote parent directory exists
-        parent = posixpath.dirname(self.remote_path.rstrip("/")) or "/"
-        try:
-            self.client.ensure_dir(parent)
-        except Exception:
-            pass
-        # Remote append 采用“读旧文本 + 覆盖上传”。read_all() 的“吞异常返回空串”适合容错读取，
-        # 但用于 append 时会导致网络抖动/鉴权异常时把历史 state 当作空串覆盖，破坏多设备协同。
-        # 因此这里显式读取并在失败时抛错，让上层 safe_append 记录 WARN 而不是清空 state。
-        created_new = False
-        try:
-            old = self.client.read_text(self.remote_path)
-        except FileNotFoundError:
-            old = ""
-            created_new = True
-        except Exception as e:
-            raise RuntimeError(f"state read failed: {e}")
-        new = old
-        if new and not new.endswith("\n"):
-            new += "\n"
-        new += line + "\n"
-        self.client.upload_text(self.remote_path, new, overwrite=True)
-        if created_new:
-            # OpenList 服务端偶尔不会立即刷新“新创建文件”的状态；触发一次 listdir(refresh=True) 提示它更新。
+            assert self.client is not None and self.remote_path is not None
+            # ensure remote parent directory exists
+            parent = posixpath.dirname(self.remote_path.rstrip("/")) or "/"
             try:
-                self.client.listdir(parent, refresh=True, per_page=1)
+                self.client.ensure_dir(parent)
             except Exception:
                 pass
+            # Remote append 采用“读旧文本 + 覆盖上传”。read_all() 的“吞异常返回空串”适合容错读取，
+            # 但用于 append 时会导致网络抖动/鉴权异常时把历史 state 当作空串覆盖，破坏多设备协同。
+            # 因此这里显式读取并在失败时抛错，让上层 safe_append 记录 WARN 而不是清空 state。
+            created_new = False
+            try:
+                old = self.client.read_text(self.remote_path)
+            except FileNotFoundError:
+                old = ""
+                created_new = True
+            except Exception as e:
+                raise RuntimeError(f"state read failed: {e}")
+            new = old
+            if new and not new.endswith("\n"):
+                new += "\n"
+            new += line + "\n"
+            self.client.upload_text(self.remote_path, new, overwrite=True)
+            if created_new:
+                # OpenList 服务端偶尔不会立即刷新“新创建文件”的状态；触发一次 listdir(refresh=True) 提示它更新。
+                try:
+                    self.client.listdir(parent, refresh=True, per_page=1)
+                except Exception:
+                    pass
 
 
 class LockBackend:
@@ -2722,9 +2726,32 @@ def main() -> None:
         if not args.dry_run:
             safe_append("fail", it, dst_rel=None)
 
-    try:
-        upload_futs: Dict[cf.Future[Tuple[WorkItem, JobResult]], WorkItem] = {}
+    upload_futs: Dict[cf.Future[Tuple[WorkItem, JobResult]], WorkItem] = {}
 
+    def drain_upload_futs(*, block: bool, only_success: bool) -> None:
+        nonlocal failed
+        while upload_futs:
+            timeout = 0.5 if block else 0.0
+            done, _ = cf.wait(upload_futs.keys(), timeout=timeout, return_when=cf.FIRST_COMPLETED)
+            if not done:
+                break
+            for fut in done:
+                it_ref = upload_futs.pop(fut, None)
+                try:
+                    it2, jr = fut.result()
+                except Exception as e:
+                    if only_success:
+                        continue
+                    failed += 1
+                    log_err(f"[FAIL] upload exception: {e}")
+                    if it_ref is not None and not args.dry_run:
+                        safe_append("fail", it_ref, dst_rel=None)
+                    continue
+                if only_success and not (jr.ok and jr.action in {"ok", "copy"}):
+                    continue
+                finalize(it2, jr)
+
+    try:
         if args.jobs <= 1:
             for it in todo:
                 if stop_event.is_set():
@@ -2750,6 +2777,9 @@ def main() -> None:
                                 coord.locks.release(st.it.rel)
                             continue
                         upload_futs[uf] = st.it
+                        # jobs=1 时主循环不 wait，因此这里顺手收割已完成的上传，
+                        # 让 done 尽快写入 state（避免多设备重复跑）。
+                        drain_upload_futs(block=False, only_success=False)
                     else:
                         finalize(st.it, st.jr)
                 except Exception as e:
@@ -2757,21 +2787,9 @@ def main() -> None:
                     log_err(f"[FAIL] worker exception: {e}")
                     if not args.dry_run:
                         safe_append("fail", it, dst_rel=None)
-            while upload_futs and not stop_event.is_set():
-                done, _ = cf.wait(upload_futs.keys(), timeout=0.5, return_when=cf.FIRST_COMPLETED)
-                if not done:
-                    continue
-                for fut in done:
-                    it_ref = upload_futs.pop(fut, None)
-                    try:
-                        it2, jr = fut.result()
-                    except Exception as e:
-                        failed += 1
-                        log_err(f"[FAIL] upload exception: {e}")
-                        if it_ref is not None and not args.dry_run:
-                            safe_append("fail", it_ref, dst_rel=None)
-                        continue
-                    finalize(it2, jr)
+
+            # stop_event 被设置时，尽量把“已完成上传”的结果写入 done（不阻塞等待未完成的上传）
+            drain_upload_futs(block=not stop_event.is_set(), only_success=stop_event.is_set())
         else:
             with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
                 it_iter = iter(todo)
@@ -2791,10 +2809,13 @@ def main() -> None:
                     if not submit_next():
                         break
 
-                while (proc_futs or upload_futs) and not stop_event.is_set():
+                while proc_futs or upload_futs:
                     all_futs: List[cf.Future[Any]] = list(proc_futs.keys()) + list(upload_futs.keys())
-                    done, _ = cf.wait(all_futs, timeout=0.5, return_when=cf.FIRST_COMPLETED)
+                    timeout = 0.5 if not stop_event.is_set() else 0.0
+                    done, _ = cf.wait(all_futs, timeout=timeout, return_when=cf.FIRST_COMPLETED)
                     if not done:
+                        if stop_event.is_set():
+                            break
                         continue
                     for fut in done:
                         it_ref = proc_futs.pop(fut, None)
@@ -2802,35 +2823,40 @@ def main() -> None:
                             try:
                                 st = fut.result()
                             except Exception as e:
-                                failed += 1
-                                log_err(f"[FAIL] worker exception: {e}")
-                                if not args.dry_run:
-                                    safe_append("fail", it_ref, dst_rel=None)
                                 if not stop_event.is_set():
+                                    failed += 1
+                                    log_err(f"[FAIL] worker exception: {e}")
+                                    if not args.dry_run:
+                                        safe_append("fail", it_ref, dst_rel=None)
                                     submit_next()
                                 continue
 
                             if st.upload_dst_path is not None:
-                                if upload_executor is None or upload_slots is None:
-                                    finalize(st.it, JobResult(False, "fail", "internal: upload executor not available"))
-                                    if not args.dry_run:
-                                        coord.locks.release(st.it.rel)
-                                else:
-                                    upload_slots.acquire()
-                                    try:
-                                        uf = upload_executor.submit(upload_worker, st.it, st.jr, st.upload_dst_path)
-                                    except Exception as e:
-                                        try:
-                                            upload_slots.release()
-                                        except ValueError:
-                                            pass
-                                        finalize(st.it, JobResult(False, "fail", f"upload submit failed: {e}"))
+                                if not stop_event.is_set():
+                                    if upload_executor is None or upload_slots is None:
+                                        finalize(st.it, JobResult(False, "fail", "internal: upload executor not available"))
                                         if not args.dry_run:
                                             coord.locks.release(st.it.rel)
                                     else:
-                                        upload_futs[uf] = st.it
+                                        upload_slots.acquire()
+                                        try:
+                                            uf = upload_executor.submit(upload_worker, st.it, st.jr, st.upload_dst_path)
+                                        except Exception as e:
+                                            try:
+                                                upload_slots.release()
+                                            except ValueError:
+                                                pass
+                                            finalize(st.it, JobResult(False, "fail", f"upload submit failed: {e}"))
+                                            if not args.dry_run:
+                                                coord.locks.release(st.it.rel)
+                                        else:
+                                            upload_futs[uf] = st.it
                             else:
-                                finalize(st.it, st.jr)
+                                if stop_event.is_set() and not (st.jr.ok and st.jr.action in {"ok", "copy"}):
+                                    # 中断时保持 processing/lock；成功的才记 done
+                                    pass
+                                else:
+                                    finalize(st.it, st.jr)
 
                             if not stop_event.is_set():
                                 submit_next()
@@ -2842,14 +2868,19 @@ def main() -> None:
                         try:
                             it2, jr = fut.result()
                         except Exception as e:
-                            failed += 1
-                            log_err(f"[FAIL] upload exception: {e}")
-                            if not args.dry_run:
-                                safe_append("fail", it_ref2, dst_rel=None)
+                            if not stop_event.is_set():
+                                failed += 1
+                                log_err(f"[FAIL] upload exception: {e}")
+                                if not args.dry_run:
+                                    safe_append("fail", it_ref2, dst_rel=None)
+                            continue
+                        if stop_event.is_set() and not (jr.ok and jr.action in {"ok", "copy"}):
                             continue
                         finalize(it2, jr)
 
                 if stop_event.is_set():
+                    # best-effort：写入已完成上传的 done（不阻塞等待未完成的上传）
+                    drain_upload_futs(block=False, only_success=True)
                     for fut in list(proc_futs.keys()):
                         fut.cancel()
                     for fut in list(upload_futs.keys()):
@@ -2858,6 +2889,9 @@ def main() -> None:
 
     except KeyboardInterrupt:
         stop_event.set()
+        # Ctrl+C 可能打断主线程的 wait/循环，导致“已完成上传”没来得及 finalize -> done。
+        # 这里 best-effort 把已完成的上传写入 done；其余保持 processing/lock 以便后续接管。
+        drain_upload_futs(block=False, only_success=True)
         if remote_client is not None:
             try:
                 remote_client.cancel_pending()
@@ -2865,7 +2899,7 @@ def main() -> None:
                 pass
 
     if stop_event.is_set():
-        log("\nInterrupted. done 已写入 state；processing 会保留并在 TTL 超时后可被接管。")
+        log("\nInterrupted. 已尽力写入已完成任务的 done；processing 会保留并在 TTL 超时后可被接管。")
 
     if prefetch_executor is not None:
         prefetch_executor.shutdown(wait=False, cancel_futures=True)
