@@ -74,18 +74,23 @@ SHRINK_MEDIA_ARGV: list[str] = [
     #
     # 默认值：打印 shrink_media.py 帮助
     "--jobs",
-    "1",
+    "2",
     "--prefetch",
     "3",
     "--upload-jobs",
-    "1",
+    "2",
 ]
 
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")
-    .uv_pip_install("httpx>=0.27", "openlist")
+    .uv_pip_install(
+        "httpx>=0.27",
+        "openlist",
+        "tenacity>=8.2",
+        "rich>=13.7",
+    )
     .env({"PYTHONUNBUFFERED": "1"})
     .add_local_file(_LOCAL_SHRINK_MEDIA, remote_path=_REMOTE_SHRINK_MEDIA)
 )
