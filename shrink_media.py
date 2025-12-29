@@ -29,10 +29,12 @@ import asyncio
 import atexit
 import concurrent.futures as cf
 import hashlib
+import itertools
 import json
 import os
 import platform
 import posixpath
+import queue
 import re
 import shlex
 import shutil
@@ -43,6 +45,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, TextIO, Tuple
@@ -296,16 +299,20 @@ class OpenListClientSync:
     def list_recursive(self, root_path: str) -> List[RemoteEntry]:
         return self._call(self._list_recursive(root_path))
 
-    def listdir(self, path: str, *, refresh: bool = False, per_page: int = 30) -> Any:
+    def listdir(self, path: str, *, refresh: bool = False, per_page: int = 30, page: int = 1) -> Any:
         assert self._client is not None
         return self._call(
             self._client.fs.listdir(
                 path if path.startswith("/") else f"/{path}",
                 refresh=refresh,
-                page=1,
+                page=page,
                 per_page=per_page,
             )
         )
+
+    def info(self, path: str) -> Any:
+        assert self._client is not None
+        return self._call(self._client.fs.info(path if path.startswith("/") else f"/{path}"))
 
     async def _list_recursive(self, root_path: str) -> List[RemoteEntry]:
         root_norm = root_path.rstrip("/") or "/"
@@ -544,6 +551,56 @@ def list_openlist_recursive(client: OpenListClientSync, root_path: str) -> List[
     return client.list_recursive(root_path)
 
 
+def iter_openlist_recursive(client: OpenListClientSync, root_path: str) -> Iterator[RemoteEntry]:
+    root_norm = root_path.rstrip("/") or "/"
+
+    try:
+        root_info = client.info(root_norm)
+    except Exception as e:
+        raise RuntimeError(f"remote info failed: {e}") from e
+
+    if not getattr(root_info, "is_dir", False):
+        yield RemoteEntry(
+            rel=posixpath.basename(root_norm),
+            path=root_norm,
+            is_dir=False,
+            size=int(getattr(root_info, "size", 0) or 0),
+            mtime_ns=_mtime_to_ns(getattr(root_info, "modified", None)),
+            sign=str(getattr(root_info, "sign", "") or ""),
+        )
+        return
+
+    def walk(cur: str) -> Iterator[RemoteEntry]:
+        page = 1
+        got = 0
+        while True:
+            res = client.listdir(cur, refresh=True, per_page=100, page=page)
+            for obj in getattr(res, "content", []) or []:
+                name = str(getattr(obj, "name", "") or "")
+                if not name:
+                    continue
+                child_path = posixpath.join(cur, name)
+                if getattr(obj, "is_dir", False):
+                    yield from walk(child_path)
+                    continue
+                rel = posixpath.relpath(child_path, root_norm).replace("\\", "/")
+                yield RemoteEntry(
+                    rel=rel,
+                    path=child_path,
+                    is_dir=False,
+                    size=int(getattr(obj, "size", 0) or 0),
+                    mtime_ns=_mtime_to_ns(getattr(obj, "modified", None)),
+                    sign=str(getattr(obj, "sign", "") or ""),
+                )
+            got += len(getattr(res, "content", []) or [])
+            total = int(getattr(res, "total", 0) or 0)
+            if not getattr(res, "content", None) or (total > 0 and got >= total):
+                break
+            page += 1
+
+    yield from walk(root_norm)
+
+
 # ------------------------
 # WorkItem & 输入枚举
 # ------------------------
@@ -558,63 +615,77 @@ class WorkItem:
     src_mtime_ns: int = 0
 
 
-def iter_local_inputs(input_path: Path) -> Tuple[Path, List[WorkItem]]:
+def iter_local_inputs(input_path: Path) -> Tuple[Path, Iterator[WorkItem]]:
     if input_path.is_file():
         st = input_path.stat()
-        return input_path.parent, [
-            WorkItem(
+        root = input_path.parent
+
+        def _one() -> Iterator[WorkItem]:
+            yield WorkItem(
                 rel=input_path.name,
                 is_remote=False,
                 src_local=input_path,
                 src_size=int(st.st_size),
                 src_mtime_ns=int(st.st_mtime_ns),
             )
-        ]
+
+        return root, _one()
 
     root = input_path
-    items: List[WorkItem] = []
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        if should_ignore_name(p.name):
-            continue
-        rel = p.relative_to(root).as_posix()
-        if rel.startswith(LOCKS_DIR_NAME + "/") or rel.startswith(STATE_DIR_NAME + "/"):
-            continue
-        st = p.stat()
-        items.append(
-            WorkItem(
+
+    def _walk_dir(d: Path) -> Iterator[WorkItem]:
+        try:
+            children = sorted(d.iterdir(), key=lambda p: p.name)
+        except Exception:
+            return
+        for p in children:
+            name = p.name
+            if should_ignore_name(name):
+                continue
+            if p.is_dir():
+                if p.is_symlink():
+                    continue
+                yield from _walk_dir(p)
+                continue
+            if not p.is_file():
+                continue
+            rel = p.relative_to(root).as_posix()
+            if rel.startswith(LOCKS_DIR_NAME + "/") or rel.startswith(STATE_DIR_NAME + "/"):
+                continue
+            try:
+                st = p.stat()
+            except Exception:
+                continue
+            yield WorkItem(
                 rel=rel,
                 is_remote=False,
                 src_local=p,
                 src_size=int(st.st_size),
                 src_mtime_ns=int(st.st_mtime_ns),
             )
-        )
-    items.sort(key=lambda x: x.rel)
-    return root, items
+
+    return root, _walk_dir(root)
 
 
-def iter_remote_inputs(client: OpenListClientSync, root_path: str) -> Tuple[str, List[WorkItem]]:
-    entries = list_openlist_recursive(client, root_path)
-    items: List[WorkItem] = []
-    for e in entries:
-        name = Path(e.rel).name
-        if should_ignore_name(name):
-            continue
-        if e.rel.startswith(LOCKS_DIR_NAME + "/") or e.rel.startswith(STATE_DIR_NAME + "/"):
-            continue
-        items.append(
-            WorkItem(
+def iter_remote_inputs(client: OpenListClientSync, root_path: str) -> Tuple[str, Iterator[WorkItem]]:
+    root_norm = root_path.rstrip("/") or "/"
+
+    def _gen() -> Iterator[WorkItem]:
+        for e in iter_openlist_recursive(client, root_norm):
+            name = Path(e.rel).name
+            if should_ignore_name(name):
+                continue
+            if e.rel.startswith(LOCKS_DIR_NAME + "/") or e.rel.startswith(STATE_DIR_NAME + "/"):
+                continue
+            yield WorkItem(
                 rel=e.rel,
                 is_remote=True,
                 remote_path=e.path,
                 src_size=e.size,
                 src_mtime_ns=e.mtime_ns,
             )
-        )
-    items.sort(key=lambda x: x.rel)
-    return root_path, items
+
+    return root_norm, _gen()
 
 
 # ------------------------
@@ -2520,7 +2591,7 @@ def main() -> None:
             log_err("ERROR: OpenList 输入需要远端客户端。")
             sys.exit(2)
         in_base, in_root_remote_path = parse_remote_location(args.input)
-        in_root_remote_path, items = iter_remote_inputs(remote_client, in_root_remote_path)
+        in_root_remote_path, items_iter = iter_remote_inputs(remote_client, in_root_remote_path)
         in_root_local: Optional[Path] = None
         in_root_display = f"{in_base}{in_root_remote_path}"
     else:
@@ -2528,13 +2599,17 @@ def main() -> None:
         if not in_path.exists():
             log_err("ERROR: 输入路径不存在。")
             sys.exit(2)
-        in_root_local, items = iter_local_inputs(in_path)
+        in_root_local, items_iter = iter_local_inputs(in_path)
         in_root_remote_path = None
         in_root_display = str(in_root_local)
 
-    if not items:
+    items_iter = iter(items_iter)
+    try:
+        first_item = next(items_iter)
+    except StopIteration:
         log("没有找到可处理的文件。")
         return
+    items_iter = itertools.chain([first_item], items_iter)
 
     # 输出位置
     out_is_remote = False
@@ -2623,19 +2698,6 @@ def main() -> None:
 
     coord = Coordinator(state_backend, lock_backend, device_id=device_id, ttl_sec=args.lock_ttl)
 
-    # 初筛
-    todo: List[WorkItem] = []
-    done_cnt = 0
-    proc_cnt = 0
-    for it in items:
-        if coord.is_done(it):
-            done_cnt += 1
-            continue
-        if coord.is_processing(it, current_device_id=device_id):
-            proc_cnt += 1
-            continue
-        todo.append(it)
-
     def dbg(msg: str) -> None:
         if args.debug:
             log(f"[DEBUG] {msg}")
@@ -2651,7 +2713,7 @@ def main() -> None:
     upload_executor: Optional[cf.ThreadPoolExecutor] = None
     upload_slots: Optional[threading.BoundedSemaphore] = None
 
-    if out_is_remote and args.upload_jobs > 0 and remote_client is not None and todo and not args.dry_run:
+    if out_is_remote and args.upload_jobs > 0 and remote_client is not None and not args.dry_run:
         upload_dir = Path(tempfile.mkdtemp(prefix="shrink_upload_"))
         dbg(f"upload dir: {upload_dir}")
         upload_executor = cf.ThreadPoolExecutor(max_workers=args.upload_jobs)
@@ -2666,18 +2728,32 @@ def main() -> None:
     # （否则会留下永远不被消费的 cached，导致 pump_prefetch() 因 cached>0 长期停摆）
     prefetch_claimed: set[str] = set()
     prefetch_executor: Optional[cf.ThreadPoolExecutor] = None
-    prefetch_iter: Optional[Iterator[WorkItem]] = None
     prefetch_mu = threading.Lock()
     prefetch_pump_mu = threading.Lock()
+    prefetch_candidates: deque[WorkItem] = deque()
+    prefetch_candidates_mu = threading.Lock()
+
+    def offer_prefetch(_it: WorkItem) -> None:
+        return
 
     def pump_prefetch() -> None:
         return
 
-    if input_is_remote and args.prefetch > 0 and remote_client is not None and todo:
+    if input_is_remote and args.prefetch > 0 and remote_client is not None:
         prefetch_dir = Path(tempfile.mkdtemp(prefix="shrink_prefetch_"))
         dbg(f"prefetch dir: {prefetch_dir}")
         prefetch_executor = cf.ThreadPoolExecutor(max_workers=args.prefetch)
-        prefetch_iter = iter([it for it in todo if it.is_remote])
+        max_cached = max(1, args.prefetch) * 2
+        max_candidates = max(1, args.prefetch) * 8
+
+        def offer_prefetch(it: WorkItem) -> None:
+            if not it.is_remote or it.remote_path is None:
+                return
+            with prefetch_candidates_mu:
+                if len(prefetch_candidates) >= max_candidates:
+                    return
+                prefetch_candidates.append(it)
+            pump_prefetch()
 
         def submit_prefetch(it: WorkItem) -> None:
             if not it.is_remote or it.remote_path is None:
@@ -2706,8 +2782,13 @@ def main() -> None:
                     prefetch_futs.pop(it.rel, None)
                     claimed = it.rel in prefetch_claimed
                     prefetch_claimed.discard(it.rel)
-                    if not claimed:
+                    if (not claimed) and (len(prefetch_results) < max_cached):
                         prefetch_results[it.rel] = res
+                    elif res[0] and res[1] is not None:
+                        try:
+                            res[1].unlink(missing_ok=True)
+                        except Exception:
+                            pass
                 ok_dl, path_dl, err = res
                 if ok_dl:
                     pdebug(f"done {it.rel} size={path_dl.stat().st_size if path_dl and path_dl.exists() else 'n/a'}")
@@ -2718,7 +2799,7 @@ def main() -> None:
             fut.add_done_callback(_done)
 
         def pump_prefetch() -> None:
-            if prefetch_executor is None or prefetch_iter is None:
+            if prefetch_executor is None:
                 return
             if stop_event.is_set():
                 return
@@ -2730,17 +2811,17 @@ def main() -> None:
                         running = len(prefetch_futs)
                         cached = len(prefetch_results)
                     pdebug(f"pump running={running} cached={cached}")
-                    # Only count running ones toward the window, but don't start if a cached
-                    # result exists for a different item to avoid blowing through the list.
-                    # Start next only when there is no cached item pending consumption.
-                    if running >= args.prefetch or cached > 0:
+                    if running >= args.prefetch or cached >= max_cached:
                         pdebug(f"window hold (running={running}, cached={cached})")
                         break
-                    try:
-                        nxt = next(prefetch_iter)
-                    except StopIteration:
+                    with prefetch_candidates_mu:
+                        nxt = prefetch_candidates.popleft() if prefetch_candidates else None
+                    if nxt is None:
                         pdebug("no more to prefetch")
                         break
+                    with prefetch_mu:
+                        if nxt.rel in prefetch_futs or nxt.rel in prefetch_results:
+                            continue
                     if not nxt.is_remote or nxt.remote_path is None:
                         continue
                     pdebug(f"dequeue {nxt.rel}")
@@ -2750,15 +2831,70 @@ def main() -> None:
 
         pump_prefetch()
 
+    scan_total = 0
+    scan_done = 0
+    scan_proc = 0
+    scan_enqueued = 0
+    scan_mu = threading.Lock()
+    scan_error: Optional[BaseException] = None
+
+    work_q: queue.Queue[Optional[WorkItem]] = queue.Queue(maxsize=max(1, args.jobs) * 4)
+
+    def scan_producer() -> None:
+        nonlocal scan_total, scan_done, scan_proc, scan_enqueued, scan_error
+        try:
+            for it in items_iter:
+                if stop_event.is_set():
+                    break
+                with scan_mu:
+                    scan_total += 1
+                if coord.is_done(it):
+                    with scan_mu:
+                        scan_done += 1
+                    continue
+                if coord.is_processing(it, current_device_id=device_id):
+                    with scan_mu:
+                        scan_proc += 1
+                    continue
+                offer_prefetch(it)
+                while not stop_event.is_set():
+                    try:
+                        work_q.put(it, timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+                with scan_mu:
+                    scan_enqueued += 1
+        except BaseException as e:
+            scan_error = e
+            stop_event.set()
+        finally:
+            while True:
+                try:
+                    work_q.put(None, timeout=0.2)
+                    break
+                except queue.Full:
+                    if stop_event.is_set():
+                        break
+
+    scan_thread = threading.Thread(target=scan_producer, name="scan_inputs")
+    scan_thread.start()
+
     log(f"Input root: {in_root_display}")
-    log(f"Total: {len(items)} | done: {done_cnt} | processing(active): {proc_cnt} | to-run: {len(todo)}")
+    log(f"Scan: streaming | jobs: {args.jobs}")
     log(f"Output: {'(inplace)' if args.inplace else (out_root_display or '')}")
     log(f"Device: {device_id} | lock ttl: {args.lock_ttl}s | steal stale: {'ON' if args.steal_stale_lock else 'OFF'}")
     log(f"Video encoder: {args.video_encoder} | Image codec: {args.image_codec}")
+    if input_is_remote:
+        log(f"Remote prefetch: {'ON' if prefetch_executor is not None else 'OFF'} | prefetch: {args.prefetch}")
     if out_is_remote:
         log(f"Remote upload async: {'ON' if upload_executor is not None else 'OFF'} | upload jobs: {args.upload_jobs}")
 
+    interrupted = False
+
     def _sig(_s: int, _f: Any) -> None:
+        nonlocal interrupted
+        interrupted = True
         stop_event.set()
         raise KeyboardInterrupt()
 
@@ -3005,8 +3141,14 @@ def main() -> None:
 
     try:
         if args.jobs <= 1:
-            for it in todo:
+            while True:
                 if stop_event.is_set():
+                    break
+                try:
+                    it = work_q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if it is None:
                     break
                 try:
                     st = worker(it)
@@ -3044,24 +3186,38 @@ def main() -> None:
             drain_upload_futs(block=not stop_event.is_set(), only_success=stop_event.is_set())
         else:
             with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
-                it_iter = iter(todo)
                 proc_futs: Dict[cf.Future[StageResult], WorkItem] = {}
+                work_done = False
 
-                def submit_next() -> bool:
-                    if stop_event.is_set():
-                        return False
-                    try:
-                        it0 = next(it_iter)
-                    except StopIteration:
-                        return False
-                    proc_futs[ex.submit(worker, it0)] = it0
-                    return True
+                def try_submit_some(limit: int) -> None:
+                    nonlocal work_done
+                    for _ in range(limit):
+                        if stop_event.is_set() or work_done:
+                            return
+                        try:
+                            it0 = work_q.get_nowait()
+                        except queue.Empty:
+                            return
+                        if it0 is None:
+                            work_done = True
+                            return
+                        proc_futs[ex.submit(worker, it0)] = it0
 
-                for _ in range(args.jobs):
-                    if not submit_next():
-                        break
+                while True:
+                    try_submit_some(max(0, args.jobs - len(proc_futs)))
+                    if not (proc_futs or upload_futs):
+                        if stop_event.is_set() or work_done:
+                            break
+                        try:
+                            it0 = work_q.get(timeout=0.5)
+                        except queue.Empty:
+                            continue
+                        if it0 is None:
+                            work_done = True
+                            continue
+                        proc_futs[ex.submit(worker, it0)] = it0
+                        continue
 
-                while proc_futs or upload_futs:
                     all_futs: List[cf.Future[Any]] = list(proc_futs.keys()) + list(upload_futs.keys())
                     timeout = 0.5 if not stop_event.is_set() else 0.0
                     done, _ = cf.wait(all_futs, timeout=timeout, return_when=cf.FIRST_COMPLETED)
@@ -3080,7 +3236,7 @@ def main() -> None:
                                     log_err(f"[FAIL] worker exception: {e}")
                                     if not args.dry_run:
                                         safe_append("fail", it_ref, dst_rel=None)
-                                    submit_next()
+                                    try_submit_some(1)
                                 continue
 
                             if st.upload_dst_path is not None:
@@ -3111,7 +3267,7 @@ def main() -> None:
                                     finalize(st.it, st.jr)
 
                             if not stop_event.is_set():
-                                submit_next()
+                                try_submit_some(1)
                             continue
 
                         it_ref2 = upload_futs.pop(fut, None)
@@ -3140,6 +3296,7 @@ def main() -> None:
                     ex.shutdown(wait=False, cancel_futures=True)
 
     except KeyboardInterrupt:
+        interrupted = True
         stop_event.set()
         # Ctrl+C 可能打断主线程的 wait/循环，导致“已完成上传”没来得及 finalize -> done。
         # 这里 best-effort 把已完成的上传写入 done；其余保持 processing/lock 以便后续接管。
@@ -3150,7 +3307,16 @@ def main() -> None:
             except Exception:
                 pass
 
-    if stop_event.is_set():
+    try:
+        scan_thread.join()
+    except Exception:
+        pass
+
+    if scan_error is not None and not interrupted:
+        failed += 1
+        log_err(f"ERROR: input scan failed: {scan_error}")
+
+    if interrupted:
         log("\nInterrupted. 已尽力写入已完成任务的 done；processing 会保留并在 TTL 超时后可被接管。")
 
     if prefetch_executor is not None:
