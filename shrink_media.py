@@ -12,13 +12,13 @@
 """
 shrink-media: 多媒体“瘦身”工具，支持本地 / OpenList 远端输入输出 + 多设备协同。
 
-特点（与旧版一致/增强）:
+特点:
 - 视频/音频/图片/漫画压缩包处理，体积不够小则回退复制
 - OpenList 递归遍历、分片上传，远端 state/lock，跨设备安全
 - 可选多线程；dry-run 预览；NVENC 优先，回退 x265/x264；opus/aac 音频；webp/avif 图片
 
 设计思路：
-- 单文件 + 标准库为主，远端使用 openlist 客户端
+- 单文件为主，远端使用 openlist 客户端
 - 结构化模块：配置、远端 IO、状态锁、分类与转码、漫画处理、执行器
 """
 
@@ -48,11 +48,13 @@ import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, TextIO, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, TextIO, Tuple
 from urllib.parse import quote, urlparse
 
 import httpx
 from openlist import Client
+from openlist.core.base import BaseService
+from openlist.exceptions import AuthenticationFailed, BadResponse, UnexceptedResponseCode
 
 # ------------------------
 # 常量/扩展名
@@ -200,6 +202,72 @@ def find_7z() -> Optional[str]:
 # ------------------------
 
 
+def patch_openlist_code_401_as_auth_failed() -> None:
+    """
+    OpenList 服务端有时会用 HTTP 200 + JSON {"code": 401, ...} 表示未认证。
+    openlist 客户端默认会把它当作 BadResponse，从而丢失 code 信息。
+    这里把 code=401 统一提升为 AuthenticationFailed，便于上层自动重新登录。
+    """
+    if getattr(BaseService, "_shrink_media_patched_code401", False):
+        return
+
+    async def _request(  # type: ignore[override]
+        self: Any,
+        method: str,
+        endpoint: str,
+        json: Optional[dict] = None,
+        params: Optional[dict] = None,
+        require_auth: bool = True,
+        expected_codes: tuple[int, ...] = (200,),
+    ) -> dict:
+        headers: Dict[str, str] = {}
+        if require_auth and getattr(self.context, "auth_token", None):
+            headers["Authorization"] = self.context.auth_token
+
+        request_kwargs: Dict[str, Any] = {"headers": headers}
+        if json is not None:
+            request_kwargs["json"] = json
+        if params is not None:
+            request_kwargs["params"] = params
+
+        http_method = getattr(self.context.httpx_client, method.lower())
+        response: httpx.Response = await http_method(endpoint, **request_kwargs)
+
+        if response.status_code == 401:
+            raise AuthenticationFailed("Unauthorized")
+        if response.status_code == 403:
+            raise AuthenticationFailed(response.json().get("message", "Forbidden"))
+        if response.status_code not in expected_codes:
+            raise UnexceptedResponseCode(response.status_code, response.json().get("message", "Unknown error"))
+
+        try:
+            data = response.json()
+        except Exception:
+            raise BadResponse("Invalid JSON response")
+
+        # 关键差异：把 code=401 当作“未认证”
+        if data.get("code") == 401:
+            raise AuthenticationFailed(data.get("message", "Unauthorized"))
+
+        if data.get("code") != 200:
+            raise BadResponse(data.get("message", "Unknown error"))
+
+        return data
+
+    BaseService._request = _request  # type: ignore[method-assign]
+    setattr(BaseService, "_shrink_media_patched_code401", True)
+
+
+class FatalAuthError(Exception):
+    pass
+
+
+class HttpStatusError(RuntimeError):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(f"http {status_code}: {message}")
+        self.status_code = status_code
+
+
 def parse_remote_location(u: str) -> Tuple[str, str]:
     pu = urlparse(u)
     base = f"{pu.scheme}://{pu.netloc}"
@@ -237,8 +305,25 @@ class RemoteEntry:
 class OpenListClientSync:
     """同步包装，便于在现有同步代码里调用 OpenList 异步客户端。"""
 
-    def __init__(self, base_url: str, user: str, password: str, *, timeout: int, otp_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        user: str,
+        password: str,
+        *,
+        timeout: int,
+        otp_key: Optional[str] = None,
+        retries: int = 3,
+        retry_backoff: float = 0.5,
+    ) -> None:
+        patch_openlist_code_401_as_auth_failed()
         self.base_url = base_url.rstrip("/")
+        self._user = user
+        self._password = password
+        self._otp_key = otp_key
+        self._retries = max(0, int(retries))
+        self._retry_backoff = max(0.0, float(retry_backoff))
+        self._login_mu = threading.Lock()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._start_loop, daemon=True)
         self._thread.start()
@@ -247,7 +332,7 @@ class OpenListClientSync:
         self._pending: set[cf.Future[Any]] = set()
         self._call(self._init_client(timeout))
         assert self._client is not None
-        self._call(self._client.login(user, password, otp_key=otp_key))
+        self._login_or_die(reason="initial login")
 
     def _start_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -262,6 +347,78 @@ class OpenListClientSync:
         finally:
             with self._pending_mu:
                 self._pending.discard(fut)
+
+    def _sleep_backoff(self, attempt: int) -> None:
+        if self._retry_backoff <= 0:
+            return
+        # attempt 从 1 开始：base, 2x, 4x...
+        delay = self._retry_backoff * (2 ** max(0, attempt - 1))
+        delay = min(delay, 30.0)
+        time.sleep(delay)
+
+    def _maybe_status_code(self, e: Exception) -> Optional[int]:
+        if isinstance(e, HttpStatusError):
+            return e.status_code
+        if isinstance(e, UnexceptedResponseCode):
+            m = re.search(r"Unexpected response code:\\s*(\\d+)", str(e))
+            if m:
+                try:
+                    return int(m.group(1))
+                except ValueError:
+                    return None
+        return None
+
+    def _is_retryable(self, e: Exception) -> bool:
+        if isinstance(e, (httpx.TimeoutException, httpx.TransportError)):
+            return True
+        code = self._maybe_status_code(e)
+        if code is None:
+            return False
+        return code >= 500 or code in {408, 425, 429}
+
+    def _login_or_die(self, *, reason: str) -> None:
+        assert self._client is not None
+        last: Optional[BaseException] = None
+        attempts = 1 + self._retries
+        for i in range(attempts):
+            try:
+                self._call(self._client.login(self._user, self._password, otp_key=self._otp_key))
+                return
+            except AuthenticationFailed as e:
+                raise FatalAuthError(f"OpenList login failed ({reason}): {e}") from e
+            except Exception as e:
+                last = e
+                if i >= (attempts - 1) or not self._is_retryable(e):
+                    raise FatalAuthError(f"OpenList login failed ({reason}): {e}") from e
+                self._sleep_backoff(i + 1)
+        raise FatalAuthError(f"OpenList login failed ({reason}): {last}")
+
+    def _relogin_or_die(self, *, reason: str) -> None:
+        with self._login_mu:
+            # 最常见场景：token 失效/服务端重启 -> 重新登录恢复
+            self._login_or_die(reason=reason)
+
+    def _call_retry(self, make_coro: Callable[[], Any], *, op: str) -> Any:
+        attempts = 1 + self._retries
+        did_relogin = False
+        last: Optional[BaseException] = None
+        for i in range(attempts):
+            try:
+                return self._call(make_coro())
+            except AuthenticationFailed as e:
+                last = e
+                if did_relogin:
+                    raise
+                did_relogin = True
+                self._relogin_or_die(reason=f"{op}: {e}")
+                continue
+            except Exception as e:
+                last = e
+                if i >= (attempts - 1) or not self._is_retryable(e):
+                    raise
+                self._sleep_backoff(i + 1)
+                continue
+        raise last  # type: ignore[misc]
 
     async def _init_client(self, timeout: int) -> None:
         self._client = Client(self.base_url, auto_refresh=True)
@@ -297,22 +454,23 @@ class OpenListClientSync:
 
     # ---- 枚举 ----
     def list_recursive(self, root_path: str) -> List[RemoteEntry]:
-        return self._call(self._list_recursive(root_path))
+        return self._call_retry(lambda: self._list_recursive(root_path), op="list_recursive")
 
     def listdir(self, path: str, *, refresh: bool = False, per_page: int = 30, page: int = 1) -> Any:
         assert self._client is not None
-        return self._call(
-            self._client.fs.listdir(
+        return self._call_retry(
+            lambda: self._client.fs.listdir(
                 path if path.startswith("/") else f"/{path}",
                 refresh=refresh,
                 page=page,
                 per_page=per_page,
-            )
+            ),
+            op="listdir",
         )
 
     def info(self, path: str) -> Any:
         assert self._client is not None
-        return self._call(self._client.fs.info(path if path.startswith("/") else f"/{path}"))
+        return self._call_retry(lambda: self._client.fs.info(path if path.startswith("/") else f"/{path}"), op="info")
 
     async def _list_recursive(self, root_path: str) -> List[RemoteEntry]:
         root_norm = root_path.rstrip("/") or "/"
@@ -369,10 +527,10 @@ class OpenListClientSync:
 
     # ---- 下载 / 读取 ----
     def download_to(self, remote_path: str, local_path: Path) -> None:
-        self._call(self._download_to(remote_path, local_path))
+        self._call_retry(lambda: self._download_to(remote_path, local_path), op="download_to")
 
     def read_bytes(self, remote_path: str) -> bytes:
-        return self._call(self._read_bytes(remote_path))
+        return self._call_retry(lambda: self._read_bytes(remote_path), op="read_bytes")
 
     def read_text(self, remote_path: str) -> str:
         b = self.read_bytes(remote_path)
@@ -382,8 +540,30 @@ class OpenListClientSync:
         url_path, headers = await self._download_request(remote_path)
         assert self._client is not None
         async with self._client.context.httpx_client.stream("GET", url_path, headers=headers) as r:
+            if r.status_code == 401:
+                raise AuthenticationFailed("Unauthorized")
+            if r.status_code == 404:
+                raise FileNotFoundError(remote_path)
             if r.status_code >= 400:
-                raise RuntimeError(f"download failed {r.status_code} {r.reason_phrase}")
+                raise HttpStatusError(r.status_code, r.reason_phrase)
+            ct = (r.headers.get("content-type") or "").lower()
+            if "application/json" in ct:
+                body = await r.aread()
+                try:
+                    data = json.loads(body.decode("utf-8", errors="replace"))
+                except Exception:
+                    data = None
+                if isinstance(data, dict) and isinstance(data.get("code"), int) and "message" in data:
+                    code = int(data.get("code") or 0)
+                    msg = str(data.get("message") or "")
+                    if code == 401:
+                        raise AuthenticationFailed(msg or "Unauthorized")
+                    if code != 200:
+                        raise BadResponse(msg or f"code={code}")
+                # 兼容下载 JSON 文件：直接写入 body（不走流式）
+                ensure_parent(local_path)
+                local_path.write_bytes(body)
+                return
             ensure_parent(local_path)
             with local_path.open("wb") as f:
                 async for chunk in r.aiter_bytes():
@@ -395,8 +575,23 @@ class OpenListClientSync:
         r = await self._client.context.httpx_client.get(url_path, headers=headers)
         if r.status_code == 404:
             raise FileNotFoundError(remote_path)
+        if r.status_code == 401:
+            raise AuthenticationFailed("Unauthorized")
         if r.status_code >= 400:
-            raise RuntimeError(f"download failed {r.status_code} {r.reason_phrase}")
+            raise HttpStatusError(r.status_code, r.reason_phrase)
+        ct = (r.headers.get("content-type") or "").lower()
+        if "application/json" in ct:
+            try:
+                data = r.json()
+            except Exception:
+                data = None
+            if isinstance(data, dict) and isinstance(data.get("code"), int) and "message" in data:
+                code = int(data.get("code") or 0)
+                msg = str(data.get("message") or "")
+                if code == 401:
+                    raise AuthenticationFailed(msg or "Unauthorized")
+                if code != 200:
+                    raise BadResponse(msg or f"code={code}")
         return r.content
 
     async def _download_request(self, remote_path: str) -> Tuple[str, Dict[str, str]]:
@@ -445,12 +640,13 @@ class OpenListClientSync:
     # ---- 上传 / 写入 ----
     def upload_file(self, remote_path: str, local_file: Path, *, overwrite: bool) -> None:
         assert self._client is not None
-        self._call(
-            self._client.fs.upload_file(
+        self._call_retry(
+            lambda: self._client.fs.upload_file(
                 remote_path if remote_path.startswith("/") else f"/{remote_path}",
                 str(local_file),
                 overwrite=overwrite,
-            )
+            ),
+            op="upload_file",
         )
 
     def direct_upload_if_available(self, remote_path: str, local_file: Path, *, overwrite: bool) -> bool:
@@ -469,17 +665,21 @@ class OpenListClientSync:
             if token:
                 headers["Authorization"] = token
             r = await self._client.context.httpx_client.post("/api/fs/get_direct_upload_info", json=payload, headers=headers)
+            if r.status_code == 401:
+                raise AuthenticationFailed("Unauthorized")
             if r.status_code != 200:
-                return None
+                raise HttpStatusError(r.status_code, r.reason_phrase)
             try:
                 data = r.json()
             except Exception:
-                return None
+                raise BadResponse("Invalid JSON response")
+            if data.get("code") == 401:
+                raise AuthenticationFailed(str(data.get("message") or "Unauthorized"))
             if data.get("code") != 200:
                 return None
             return data.get("data")
 
-        info = self._call(_get_info())
+        info = self._call_retry(_get_info, op="direct_upload:get_info")
         if not info:
             return False
 
@@ -499,8 +699,10 @@ class OpenListClientSync:
                     "Content-Range": f"bytes {start}-{end}/{size}",
                 }
                 r = await self._client.context.httpx_client.request(method, upload_url, content=chunk, headers=headers)
+                if r.status_code == 401:
+                    raise AuthenticationFailed("Unauthorized")
                 if r.status_code >= 400:
-                    raise RuntimeError(f"direct upload failed {r.status_code} {r.reason_phrase}")
+                    raise HttpStatusError(r.status_code, r.reason_phrase)
 
             with local_file.open("rb") as f:
                 offset = 0
@@ -511,7 +713,7 @@ class OpenListClientSync:
                     await _upload_chunk(offset, chunk)
                     offset += len(chunk)
 
-        self._call(_direct_upload())
+        self._call_retry(_direct_upload, op="direct_upload:upload")
         return True
 
     def upload_text(self, remote_path: str, text: str, *, overwrite: bool) -> None:
@@ -520,24 +722,30 @@ class OpenListClientSync:
 
     def upload_bytes(self, remote_path: str, data: bytes, *, overwrite: bool) -> None:
         assert self._client is not None
-        self._call(
-            self._client.fs.upload(
+        self._call_retry(
+            lambda: self._client.fs.upload(
                 remote_path if remote_path.startswith("/") else f"/{remote_path}",
                 data,
                 overwrite=overwrite,
                 last_modified=int(time.time()),
-            )
+            ),
+            op="upload_bytes",
         )
 
     # ---- 其他 ----
     def ensure_dir(self, path: str) -> None:
         assert self._client is not None
-        self._call(self._client.fs.makedirs(path if path.startswith("/") else f"/{path}", exist_ok=True))
+        self._call_retry(
+            lambda: self._client.fs.makedirs(path if path.startswith("/") else f"/{path}", exist_ok=True),
+            op="ensure_dir",
+        )
 
     def remove(self, path: str) -> None:
         try:
             assert self._client is not None
             self._call(self._client.fs.remove(path if path.startswith("/") else f"/{path}"))
+        except FatalAuthError:
+            raise
         except Exception:
             pass
 
@@ -556,6 +764,8 @@ def iter_openlist_recursive(client: OpenListClientSync, root_path: str) -> Itera
 
     try:
         root_info = client.info(root_norm)
+    except FatalAuthError:
+        raise
     except Exception as e:
         raise RuntimeError(f"remote info failed: {e}") from e
 
@@ -728,6 +938,8 @@ class StateBackendJsonl:
             return self.client.read_text(self.remote_path)
         except FileNotFoundError:
             return ""
+        except FatalAuthError:
+            raise
         except Exception:
             return ""
 
@@ -747,6 +959,8 @@ class StateBackendJsonl:
             parent = posixpath.dirname(self.remote_path.rstrip("/")) or "/"
             try:
                 self.client.ensure_dir(parent)
+            except FatalAuthError:
+                raise
             except Exception:
                 pass
             # Remote append 采用“读旧文本 + 覆盖上传”。read_all() 的“吞异常返回空串”适合容错读取，
@@ -758,6 +972,8 @@ class StateBackendJsonl:
             except FileNotFoundError:
                 old = ""
                 created_new = True
+            except FatalAuthError:
+                raise
             except Exception as e:
                 raise RuntimeError(f"state read failed: {e}")
             new = old
@@ -769,6 +985,8 @@ class StateBackendJsonl:
                 # OpenList 服务端偶尔不会立即刷新“新创建文件”的状态；触发一次 listdir(refresh=True) 提示它更新。
                 try:
                     self.client.listdir(parent, refresh=True, per_page=1)
+                except FatalAuthError:
+                    raise
                 except Exception:
                     pass
 
@@ -815,6 +1033,8 @@ class StateBackendPerFile:
             txt = self.client.read_text(self.legacy_jsonl_path)
         except FileNotFoundError:
             txt = ""
+        except FatalAuthError:
+            raise
         except Exception:
             txt = ""
         latest: Dict[str, StateEntry] = {}
@@ -862,9 +1082,13 @@ class StateBackendPerFile:
             if ent is not None and ent.status == "done":
                 try:
                     self.write_latest(ent)
+                except FatalAuthError:
+                    raise
                 except Exception:
                     pass
             return ent
+        except FatalAuthError:
+            raise
         except Exception:
             return None
         try:
@@ -911,6 +1135,8 @@ class StateBackendPerFile:
         # OpenList 服务端偶尔不会立即刷新文件变更；触发一次 listdir(refresh=True) 提示它更新。
         try:
             self.client.listdir(parent, refresh=True, per_page=1)
+        except FatalAuthError:
+            raise
         except Exception:
             pass
 
@@ -974,6 +1200,8 @@ class LockBackend:
             ts = float(obj.get("ts", 0) or 0)
         except FileNotFoundError:
             return False
+        except FatalAuthError:
+            raise
         except Exception:
             return False
         return ts > 0 and (now - ts) <= self.ttl_sec
@@ -1031,6 +1259,8 @@ class LockBackend:
                 return False, f"locked by {owner or 'unknown'}"
         except FileNotFoundError:
             stale = True
+        except FatalAuthError:
+            raise
         except Exception as e:
             # 读锁失败：为了不断跑（默认 steal_stale=ON）可以继续尝试接管；
             # 但当明确关闭 steal 时，应该把它当作“有人在跑/未知状态”来避免误抢。
@@ -1047,9 +1277,13 @@ class LockBackend:
             # OpenList 服务端偶尔不会立即刷新“新创建/更新 lock 文件”的状态；触发一次 listdir(refresh=True) 提示它更新。
             try:
                 self.client.listdir(self.remote_dir_path, refresh=True, per_page=1)
+            except FatalAuthError:
+                raise
             except Exception:
                 pass
             return True, "stolen" if (stale and owner) else "ok"
+        except FatalAuthError:
+            raise
         except Exception as e:
             return False, f"lock write failed: {e}"
 
@@ -1067,11 +1301,15 @@ class LockBackend:
         lock_file = remote_join(self.remote_dir_path, f"{token}.lock")
         try:
             self.client.remove(lock_file)
+        except FatalAuthError:
+            raise
         except Exception:
             pass
         # 删除锁后也刷新一下目录，避免服务端缓存导致其他设备仍“看见”旧锁。
         try:
             self.client.listdir(self.remote_dir_path, refresh=True, per_page=1)
+        except FatalAuthError:
+            raise
         except Exception:
             pass
 
@@ -1172,6 +1410,8 @@ class Coordinator:
         # processing 仅作为提示；真实“是否有人在跑”以 lock 为准（读失败则当作不活跃，优先不断跑）
         try:
             return self.locks.is_active(it.rel)
+        except FatalAuthError:
+            raise
         except Exception:
             return False
 
@@ -2062,6 +2302,8 @@ def upload_file_remote(
             ok = client.direct_upload_if_available(dst_path, local_file, overwrite=overwrite)
             if ok:
                 return
+        except FatalAuthError:
+            raise
         except Exception as e:
             if isinstance(e, cf.CancelledError) or (cancel_event is not None and cancel_event.is_set()):
                 raise
@@ -2486,6 +2728,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--openlist-pass", type=str, default=None)
     ap.add_argument("--openlist-otp", type=str, default=None)
     ap.add_argument("--openlist-timeout", type=int, default=None)
+    ap.add_argument("--retries", type=int, default=3, help="OpenList 网络失败重试次数（0 表示不重试）")
+    ap.add_argument("--retry-backoff", type=float, default=0.5, help="OpenList 重试退避基准秒数（指数退避）")
     ap.add_argument(
         "--prefetch",
         type=int,
@@ -2533,6 +2777,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     if args.archive_password is None:
         args.archive_password = _env_nonempty("SHRINK_MEDIA_ARCHIVE_PASSWORD") or _env_nonempty("ARCHIVE_PASSWORD")
 
+    if args.retries < 0:
+        ap.error("--retries must be >= 0")
+    if args.retry_backoff < 0:
+        ap.error("--retry-backoff must be >= 0")
+
     if args.device_id is None:
         args.device_id = _env_nonempty("SHRINK_MEDIA_DEVICE_ID") or _env_nonempty("DEVICE_ID")
 
@@ -2575,6 +2824,8 @@ def main() -> None:
             args.openlist_pass,
             timeout=args.openlist_timeout,
             otp_key=args.openlist_otp,
+            retries=args.retries,
+            retry_backoff=args.retry_backoff,
         )
     # 同一服务器检查（目前仅支持单服务器）
     if is_url(args.input) and args.output and is_url(args.output):
@@ -2659,6 +2910,8 @@ def main() -> None:
                         args.openlist_pass,
                         timeout=args.openlist_timeout,
                         otp_key=args.openlist_otp,
+                        retries=args.retries,
+                        retry_backoff=args.retry_backoff,
                     )
                 out_root_remote_path = path_out if path_out.endswith("/") else path_out
                 out_root_display = f"{base_out}{out_root_remote_path}"
@@ -2707,6 +2960,21 @@ def main() -> None:
             log(f"[PREFETCH] {msg}")
 
     stop_event = threading.Event()
+    fatal_mu = threading.Lock()
+    fatal_error: Optional[FatalAuthError] = None
+
+    def set_fatal(e: FatalAuthError) -> None:
+        nonlocal fatal_error
+        with fatal_mu:
+            if fatal_error is None:
+                fatal_error = e
+        stop_event.set()
+
+    def raise_if_fatal() -> None:
+        with fatal_mu:
+            e = fatal_error
+        if e is not None:
+            raise e
 
     # 异步上传（让“转码”与“上传”在不同线程池中流水线并行）
     upload_dir: Optional[Path] = None
@@ -2765,6 +3033,8 @@ def main() -> None:
                     ensure_parent(target)
                     remote_client.download_to(it.remote_path, target)
                     return True, target, ""
+                except FatalAuthError:
+                    raise
                 except Exception as e:
                     return False, None, str(e)
 
@@ -2776,6 +3046,9 @@ def main() -> None:
             def _done(f: cf.Future) -> None:
                 try:
                     res = f.result()
+                except FatalAuthError as e:
+                    set_fatal(e)
+                    return
                 except Exception as e:
                     res = (False, None, str(e))
                 with prefetch_mu:
@@ -2867,6 +3140,8 @@ def main() -> None:
                     scan_enqueued += 1
         except BaseException as e:
             scan_error = e
+            if isinstance(e, FatalAuthError):
+                set_fatal(e)
             stop_event.set()
         finally:
             while True:
@@ -2904,6 +3179,10 @@ def main() -> None:
     ok = 0
     skipped = 0
     failed = 0
+    failed_items: Dict[str, str] = {}
+
+    def record_fail(it: WorkItem, msg: str) -> None:
+        failed_items[it.rel] = msg
 
     @dataclass
     class StageResult:
@@ -2914,6 +3193,8 @@ def main() -> None:
     def safe_append(status: str, it: WorkItem, *, dst_rel: Optional[str] = None) -> None:
         try:
             coord.append(status, it, dst_rel=dst_rel)
+        except FatalAuthError:
+            raise
         except Exception as e:
             log_err(f"[WARN] state append failed ({status}) for {it.rel}: {e}")
 
@@ -2925,6 +3206,8 @@ def main() -> None:
             dbg(f"upload {jr.out_local} -> {dst_path}")
             upload_file_remote(remote_client, jr.out_local, dst_path, overwrite=args.overwrite, cancel_event=stop_event)
             return it, JobResult(True, jr.action, jr.msg, None, jr.out_rel)
+        except FatalAuthError:
+            raise
         except Exception as e:
             return it, JobResult(False, "fail", f"upload failed: {e}")
         finally:
@@ -2984,6 +3267,8 @@ def main() -> None:
                     if res is None and fut is not None:
                         try:
                             res = fut.result()
+                        except FatalAuthError:
+                            raise
                         except Exception as e:
                             res = (False, None, str(e))
                     # after consuming any cached/active prefetch, allow queue refill
@@ -2993,29 +3278,35 @@ def main() -> None:
                         if args.prefetch_debug:
                             pdebug(f"use {'hit' if ok_dl else 'miss'} {it.rel}")
                         if ok_dl and path_dl is not None:
-                            try:
-                                ensure_parent(local_src)
-                                dbg(f"prefetch copy {path_dl} -> {local_src}")
-                                shutil.copy2(path_dl, local_src)
-                                if size_of(local_src) != it.src_size:
-                                    dbg(f"size mismatch; re-download {it.remote_path}")
-                                    remote_client.download_to(it.remote_path, local_src)
                                 try:
-                                    path_dl.unlink(missing_ok=True)  # cleanup consumed prefetch
-                                except Exception:
-                                    pass
-                            except Exception as e:
-                                return StageResult(it, JobResult(False, "fail", f"prefetch copy failed: {e}"))
+                                    ensure_parent(local_src)
+                                    dbg(f"prefetch copy {path_dl} -> {local_src}")
+                                    shutil.copy2(path_dl, local_src)
+                                    if size_of(local_src) != it.src_size:
+                                        dbg(f"size mismatch; re-download {it.remote_path}")
+                                        remote_client.download_to(it.remote_path, local_src)
+                                    try:
+                                        path_dl.unlink(missing_ok=True)  # cleanup consumed prefetch
+                                    except Exception:
+                                        pass
+                                except FatalAuthError:
+                                    raise
+                                except Exception as e:
+                                    return StageResult(it, JobResult(False, "fail", f"prefetch copy failed: {e}"))
                         else:
                             try:
                                 dbg(f"prefetch miss -> download {it.remote_path}")
                                 remote_client.download_to(it.remote_path, local_src)
+                            except FatalAuthError:
+                                raise
                             except Exception as e:
                                 return StageResult(it, JobResult(False, "fail", f"prefetch+download failed: {err or e}"))
                     else:
                         try:
                             dbg(f"download {it.remote_path} -> {local_src}")
                             remote_client.download_to(it.remote_path, local_src)
+                        except FatalAuthError:
+                            raise
                         except Exception as e:
                             return StageResult(it, JobResult(False, "fail", f"download failed: {e}"))
                 else:
@@ -3076,6 +3367,8 @@ def main() -> None:
                     try:
                         dbg(f"upload {jr.out_local} -> {dst_path}")
                         upload_file_remote(remote_client, jr.out_local, dst_path, overwrite=args.overwrite, cancel_event=stop_event)
+                    except FatalAuthError:
+                        raise
                     except Exception as e:
                         return StageResult(it, JobResult(False, "fail", f"upload failed: {e}"))
                     return StageResult(it, JobResult(True, jr.action, jr.msg, None, jr.out_rel))
@@ -3110,6 +3403,7 @@ def main() -> None:
             return
 
         failed += 1
+        record_fail(it, jr.msg)
         log_err(f"[FAIL] {it.rel} | {jr.msg}")
         if not args.dry_run:
             safe_append("fail", it, dst_rel=None)
@@ -3127,10 +3421,14 @@ def main() -> None:
                 it_ref = upload_futs.pop(fut, None)
                 try:
                     it2, jr = fut.result()
+                except FatalAuthError:
+                    raise
                 except Exception as e:
                     if only_success:
                         continue
                     failed += 1
+                    if it_ref is not None:
+                        record_fail(it_ref, f"upload exception: {e}")
                     log_err(f"[FAIL] upload exception: {e}")
                     if it_ref is not None and not args.dry_run:
                         safe_append("fail", it_ref, dst_rel=None)
@@ -3142,6 +3440,7 @@ def main() -> None:
     try:
         if args.jobs <= 1:
             while True:
+                raise_if_fatal()
                 if stop_event.is_set():
                     break
                 try:
@@ -3176,8 +3475,11 @@ def main() -> None:
                         drain_upload_futs(block=False, only_success=False)
                     else:
                         finalize(st.it, st.jr)
+                except FatalAuthError:
+                    raise
                 except Exception as e:
                     failed += 1
+                    record_fail(it, f"worker exception: {e}")
                     log_err(f"[FAIL] worker exception: {e}")
                     if not args.dry_run:
                         safe_append("fail", it, dst_rel=None)
@@ -3204,6 +3506,7 @@ def main() -> None:
                         proc_futs[ex.submit(worker, it0)] = it0
 
                 while True:
+                    raise_if_fatal()
                     try_submit_some(max(0, args.jobs - len(proc_futs)))
                     if not (proc_futs or upload_futs):
                         if stop_event.is_set() or work_done:
@@ -3230,9 +3533,12 @@ def main() -> None:
                         if it_ref is not None:
                             try:
                                 st = fut.result()
+                            except FatalAuthError:
+                                raise
                             except Exception as e:
                                 if not stop_event.is_set():
                                     failed += 1
+                                    record_fail(it_ref, f"worker exception: {e}")
                                     log_err(f"[FAIL] worker exception: {e}")
                                     if not args.dry_run:
                                         safe_append("fail", it_ref, dst_rel=None)
@@ -3275,9 +3581,12 @@ def main() -> None:
                             continue
                         try:
                             it2, jr = fut.result()
+                        except FatalAuthError:
+                            raise
                         except Exception as e:
                             if not stop_event.is_set():
                                 failed += 1
+                                record_fail(it_ref2, f"upload exception: {e}")
                                 log_err(f"[FAIL] upload exception: {e}")
                                 if not args.dry_run:
                                     safe_append("fail", it_ref2, dst_rel=None)
@@ -3312,6 +3621,8 @@ def main() -> None:
     except Exception:
         pass
 
+    raise_if_fatal()
+
     if scan_error is not None and not interrupted:
         failed += 1
         log_err(f"ERROR: input scan failed: {scan_error}")
@@ -3344,9 +3655,17 @@ def main() -> None:
             pass
 
     log(f"\nSummary: OK={ok}, SKIP/COPY={skipped}, FAIL={failed}")
+    if failed_items:
+        log("Failed files:")
+        for rel, msg in sorted(failed_items.items()):
+            log(f"- {rel} | {msg}")
     if failed:
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except FatalAuthError as e:
+        log_err(f"ERROR: {e}")
+        sys.exit(2)
