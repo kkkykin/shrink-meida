@@ -4,6 +4,7 @@
 # dependencies = [
 #   "httpx>=0.27",
 #   "openlist",
+#   "tenacity>=8.2",
 # ]
 # [[tool.uv.index]]
 # url = "https://mirrors.ustc.edu.cn/pypi/simple/"
@@ -55,6 +56,7 @@ import httpx
 from openlist import Client
 from openlist.core.base import BaseService
 from openlist.exceptions import AuthenticationFailed, BadResponse, UnexceptedResponseCode
+from tenacity import Retrying, RetryCallState, retry_if_exception, stop_after_attempt
 
 # ------------------------
 # 常量/扩展名
@@ -348,13 +350,17 @@ class OpenListClientSync:
             with self._pending_mu:
                 self._pending.discard(fut)
 
-    def _sleep_backoff(self, attempt: int) -> None:
+    def _retry_wait(self, retry_state: RetryCallState) -> float:
         if self._retry_backoff <= 0:
-            return
-        # attempt 从 1 开始：base, 2x, 4x...
+            return 0.0
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        if isinstance(exc, AuthenticationFailed):
+            # token 失效：relogin 后立即重试，不额外退避
+            return 0.0
+        attempt = int(getattr(retry_state, "attempt_number", 1) or 1)
+        attempt = max(1, attempt)
         delay = self._retry_backoff * (2 ** max(0, attempt - 1))
-        delay = min(delay, 30.0)
-        time.sleep(delay)
+        return min(delay, 30.0)
 
     def _maybe_status_code(self, e: Exception) -> Optional[int]:
         if isinstance(e, HttpStatusError):
@@ -378,20 +384,26 @@ class OpenListClientSync:
 
     def _login_or_die(self, *, reason: str) -> None:
         assert self._client is not None
-        last: Optional[BaseException] = None
         attempts = 1 + self._retries
-        for i in range(attempts):
-            try:
-                self._call(self._client.login(self._user, self._password, otp_key=self._otp_key))
-                return
-            except AuthenticationFailed as e:
-                raise FatalAuthError(f"OpenList login failed ({reason}): {e}") from e
-            except Exception as e:
-                last = e
-                if i >= (attempts - 1) or not self._is_retryable(e):
-                    raise FatalAuthError(f"OpenList login failed ({reason}): {e}") from e
-                self._sleep_backoff(i + 1)
-        raise FatalAuthError(f"OpenList login failed ({reason}): {last}")
+
+        def _should_retry(e: BaseException) -> bool:
+            return isinstance(e, Exception) and (not isinstance(e, AuthenticationFailed)) and self._is_retryable(e)
+
+        try:
+            retrying = Retrying(
+                stop=stop_after_attempt(attempts),
+                retry=retry_if_exception(_should_retry),
+                wait=self._retry_wait,
+                reraise=True,
+            )
+            for attempt in retrying:
+                with attempt:
+                    self._call(self._client.login(self._user, self._password, otp_key=self._otp_key))
+                    return
+        except AuthenticationFailed as e:
+            raise FatalAuthError(f"OpenList login failed ({reason}): {e}") from e
+        except Exception as e:
+            raise FatalAuthError(f"OpenList login failed ({reason}): {e}") from e
 
     def _relogin_or_die(self, *, reason: str) -> None:
         with self._login_mu:
@@ -401,24 +413,27 @@ class OpenListClientSync:
     def _call_retry(self, make_coro: Callable[[], Any], *, op: str) -> Any:
         attempts = 1 + self._retries
         did_relogin = False
-        last: Optional[BaseException] = None
-        for i in range(attempts):
-            try:
-                return self._call(make_coro())
-            except AuthenticationFailed as e:
-                last = e
+
+        def _should_retry(e: BaseException) -> bool:
+            nonlocal did_relogin
+            if isinstance(e, AuthenticationFailed):
                 if did_relogin:
-                    raise
+                    return False
                 did_relogin = True
                 self._relogin_or_die(reason=f"{op}: {e}")
-                continue
-            except Exception as e:
-                last = e
-                if i >= (attempts - 1) or not self._is_retryable(e):
-                    raise
-                self._sleep_backoff(i + 1)
-                continue
-        raise last  # type: ignore[misc]
+                return True
+            return isinstance(e, Exception) and self._is_retryable(e)
+
+        retrying = Retrying(
+            stop=stop_after_attempt(attempts),
+            retry=retry_if_exception(_should_retry),
+            wait=self._retry_wait,
+            reraise=True,
+        )
+        for attempt in retrying:
+            with attempt:
+                return self._call(make_coro())
+        raise AssertionError("unreachable")
 
     async def _init_client(self, timeout: int) -> None:
         self._client = Client(self.base_url, auto_refresh=True)
