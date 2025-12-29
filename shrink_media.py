@@ -5,6 +5,7 @@
 #   "httpx>=0.27",
 #   "openlist",
 #   "tenacity>=8.2",
+#   "rich>=13.7",
 # ]
 # [[tool.uv.index]]
 # url = "https://mirrors.ustc.edu.cn/pypi/simple/"
@@ -27,11 +28,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import atexit
 import concurrent.futures as cf
 import hashlib
 import itertools
 import json
+import logging
 import os
 import platform
 import posixpath
@@ -49,13 +50,16 @@ import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, TextIO, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
 import httpx
 from openlist import Client
 from openlist.core.base import BaseService
 from openlist.exceptions import AuthenticationFailed, BadResponse, UnexceptedResponseCode
+from rich.console import Console
+from rich.filesize import decimal as format_bytes
+from rich.logging import RichHandler
 from tenacity import Retrying, RetryCallState, retry_if_exception, stop_after_attempt
 
 # ------------------------
@@ -83,55 +87,89 @@ LOCKS_DIR_NAME = ".shrink_media_locks"
 # 简易日志
 # ------------------------
 
-_LOG_FH: Optional[TextIO] = None
-_LOG_LOCK = threading.Lock()
+_LOGGER = logging.getLogger("shrink_media")
+_DEBUG_ENABLED = False
+_PREFETCH_DEBUG_ENABLED = False
 
 
-def configure_logging(log_file: Optional[str], *, append: bool) -> None:
-    global _LOG_FH
-    if not log_file:
-        return
-    p = Path(log_file)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    mode = "a" if append else "w"
-    try:
-        _LOG_FH = p.open(mode, encoding="utf-8", errors="replace")
-    except Exception as e:
-        log_err(f"ERROR: cannot open --log-file {p}: {e}")
-        sys.exit(2)
+class _LevelRangeFilter(logging.Filter):
+    def __init__(self, *, min_level: int | None = None, max_level: int | None = None) -> None:
+        super().__init__()
+        self._min_level = min_level
+        self._max_level = max_level
 
-    def _close() -> None:
-        global _LOG_FH
-        if _LOG_FH is None:
-            return
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._min_level is not None and record.levelno < self._min_level:
+            return False
+        if self._max_level is not None and record.levelno > self._max_level:
+            return False
+        return True
+
+
+def configure_logging(log_file: Optional[str], *, append: bool, debug: bool, prefetch_debug: bool) -> None:
+    global _DEBUG_ENABLED, _PREFETCH_DEBUG_ENABLED
+    _DEBUG_ENABLED = bool(debug) or bool(log_file)
+    _PREFETCH_DEBUG_ENABLED = bool(prefetch_debug)
+
+    any_debug_console = bool(debug) or bool(prefetch_debug)
+    _LOGGER.setLevel(logging.DEBUG)
+    _LOGGER.propagate = False
+    _LOGGER.handlers.clear()
+
+    level = logging.DEBUG if any_debug_console else logging.INFO
+
+    stdout_console = Console(stderr=False)
+    stderr_console = Console(stderr=True)
+
+    stdout_handler = RichHandler(
+        console=stdout_console,
+        show_time=True,
+        show_level=True,
+        show_path=False,
+        rich_tracebacks=any_debug_console,
+        markup=False,
+    )
+    stdout_handler.setLevel(level)
+    stdout_handler.addFilter(_LevelRangeFilter(max_level=logging.INFO))
+    _LOGGER.addHandler(stdout_handler)
+
+    stderr_handler = RichHandler(
+        console=stderr_console,
+        show_time=True,
+        show_level=True,
+        show_path=False,
+        rich_tracebacks=any_debug_console,
+        markup=False,
+    )
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.addFilter(_LevelRangeFilter(min_level=logging.WARNING))
+    _LOGGER.addHandler(stderr_handler)
+
+    if log_file:
+        p = Path(log_file)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a" if append else "w"
         try:
-            _LOG_FH.flush()
-        except Exception:
-            pass
-        try:
-            _LOG_FH.close()
-        except Exception:
-            pass
-        _LOG_FH = None
-
-    atexit.register(_close)
-
-
-def _write_log_line(msg: str, *, is_err: bool) -> None:
-    if _LOG_FH is None:
-        print(msg, file=(sys.stderr if is_err else sys.stdout), flush=True)
-        return
-    with _LOG_LOCK:
-        _LOG_FH.write(msg + "\n")
-        _LOG_FH.flush()
+            fh = logging.FileHandler(p, mode=mode, encoding="utf-8")
+        except Exception as e:
+            print(f"ERROR: cannot open --log-file {p}: {e}", file=sys.stderr, flush=True)
+            sys.exit(2)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        _LOGGER.addHandler(fh)
 
 
 def log(msg: str) -> None:
-    _write_log_line(msg, is_err=False)
+    _LOGGER.info(msg)
 
 
 def log_err(msg: str) -> None:
-    _write_log_line(msg, is_err=True)
+    _LOGGER.error(msg)
 
 
 # ------------------------
@@ -170,6 +208,19 @@ def size_of(p: Path) -> int:
         return p.stat().st_size
     except Exception:
         return -1
+
+
+def fmt_bytes(n: int) -> str:
+    if n < 0:
+        return "n/a"
+    return format_bytes(n)
+
+
+def fmt_size_change(src_sz: int, out_sz: int) -> str:
+    if src_sz > 0 and out_sz > 0:
+        pct = (out_sz - src_sz) * 100.0 / src_sz
+        return f"{fmt_bytes(src_sz)} -> {fmt_bytes(out_sz)} ({pct:+.1f}%)"
+    return f"{src_sz}->{out_sz}"
 
 
 def looks_like_archive_name(name: str) -> bool:
@@ -389,11 +440,19 @@ class OpenListClientSync:
         def _should_retry(e: BaseException) -> bool:
             return isinstance(e, Exception) and (not isinstance(e, AuthenticationFailed)) and self._is_retryable(e)
 
+        def _before_sleep(rs: RetryCallState) -> None:
+            if not (_DEBUG_ENABLED or _PREFETCH_DEBUG_ENABLED):
+                return
+            exc = rs.outcome.exception() if rs.outcome else None
+            sleep = float(getattr(getattr(rs, "next_action", None), "sleep", 0.0) or 0.0)
+            _LOGGER.debug("retry login attempt=%d/%d sleep=%.2fs err=%r", rs.attempt_number, attempts, sleep, exc)
+
         try:
             retrying = Retrying(
                 stop=stop_after_attempt(attempts),
                 retry=retry_if_exception(_should_retry),
                 wait=self._retry_wait,
+                before_sleep=_before_sleep,
                 reraise=True,
             )
             for attempt in retrying:
@@ -424,10 +483,18 @@ class OpenListClientSync:
                 return True
             return isinstance(e, Exception) and self._is_retryable(e)
 
+        def _before_sleep(rs: RetryCallState) -> None:
+            if not (_DEBUG_ENABLED or _PREFETCH_DEBUG_ENABLED):
+                return
+            exc = rs.outcome.exception() if rs.outcome else None
+            sleep = float(getattr(getattr(rs, "next_action", None), "sleep", 0.0) or 0.0)
+            _LOGGER.debug("retry %s attempt=%d/%d sleep=%.2fs err=%r", op, rs.attempt_number, attempts, sleep, exc)
+
         retrying = Retrying(
             stop=stop_after_attempt(attempts),
             retry=retry_if_exception(_should_retry),
             wait=self._retry_wait,
+            before_sleep=_before_sleep,
             reraise=True,
         )
         for attempt in retrying:
@@ -2044,6 +2111,9 @@ def run_ffmpeg_with_candidates(
     if out_final.exists() and not overwrite:
         return True, f"output exists: {out_final}"
 
+    if _DEBUG_ENABLED:
+        _LOGGER.debug("ffmpeg candidates=%d out=%s", len(candidates), out_final)
+
     # 保留原始扩展名，避免 ffmpeg 因未知扩展无法推断格式
     suffix = out_final.suffix
     tmp_name = out_final.stem + ".__tmp__" + suffix
@@ -2051,8 +2121,10 @@ def run_ffmpeg_with_candidates(
     ensure_parent(out_tmp)
     last_err = ""
 
-    for cmd in candidates:
+    for idx, cmd in enumerate(candidates):
         cmd2 = replace_last(cmd, str(out_tmp))
+        if _DEBUG_ENABLED:
+            _LOGGER.debug("ffmpeg run %d/%d: %s", idx + 1, len(candidates), shlex.join(cmd2))
 
         try:
             if out_tmp.exists():
@@ -2071,6 +2143,8 @@ def run_ffmpeg_with_candidates(
         )
 
         if cp.returncode == 0:
+            if _DEBUG_ENABLED:
+                _LOGGER.debug("ffmpeg ok %d/%d -> %s", idx + 1, len(candidates), out_tmp)
             try:
                 if out_final.exists():
                     if overwrite:
@@ -2098,6 +2172,8 @@ def run_ffmpeg_with_candidates(
             except Exception:
                 pass
             last_err = tail_text(cp.stderr, n_lines=60, max_chars=6000)
+            if _DEBUG_ENABLED:
+                _LOGGER.debug("ffmpeg fail %d/%d exit=%d: %s", idx + 1, len(candidates), cp.returncode, last_err)
 
     return False, (last_err or "ffmpeg failed")
 
@@ -2129,7 +2205,11 @@ def list_archive_paths(archiver: str, archive: Path, *, password: Optional[str],
     if dry_run:
         log("[dry-run] " + " ".join(mask_cmd(cmd, password)))
         return []
+    if _DEBUG_ENABLED:
+        _LOGGER.debug("[7z] list: %s", " ".join(mask_cmd(cmd, password)))
     cp = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if _DEBUG_ENABLED:
+        _LOGGER.debug("[7z] list exit=%d archive=%s", cp.returncode, archive)
     if cp.returncode != 0:
         return None
     paths: List[str] = []
@@ -2147,7 +2227,11 @@ def extract_archive(archiver: str, archive: Path, out_dir: Path, *, password: Op
     if dry_run:
         log("[dry-run] " + " ".join(mask_cmd(cmd, password)))
         return True
+    if _DEBUG_ENABLED:
+        _LOGGER.debug("[7z] extract: %s", " ".join(mask_cmd(cmd, password)))
     cp = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if _DEBUG_ENABLED:
+        _LOGGER.debug("[7z] extract exit=%d archive=%s", cp.returncode, archive)
     return cp.returncode == 0
 
 
@@ -2312,10 +2396,16 @@ def upload_file_remote(
     parent = posixpath.dirname(dst_path.rstrip("/")) or "/"
     client.ensure_dir(parent)
     size = local_file.stat().st_size
+    if _DEBUG_ENABLED:
+        _LOGGER.debug("upload prepare dst=%s size=%s overwrite=%s", dst_path, fmt_bytes(size), overwrite)
     if size > 95 * 1024 * 1024:
         try:
+            if _DEBUG_ENABLED:
+                _LOGGER.debug("upload try direct (>=95MiB)")
             ok = client.direct_upload_if_available(dst_path, local_file, overwrite=overwrite)
             if ok:
+                if _DEBUG_ENABLED:
+                    _LOGGER.debug("upload direct ok")
                 return
         except FatalAuthError:
             raise
@@ -2325,7 +2415,11 @@ def upload_file_remote(
             log_err(f"[WARN] direct upload failed, fallback normal: {e!r}")
     if cancel_event is not None and cancel_event.is_set():
         raise cf.CancelledError()
+    if _DEBUG_ENABLED:
+        _LOGGER.debug("upload try normal")
     client.upload_file(dst_path, local_file, overwrite=overwrite)
+    if _DEBUG_ENABLED:
+        _LOGGER.debug("upload normal ok")
 
 
 # ------------------------
@@ -2560,9 +2654,15 @@ def process_one_local(
             if err:
                 return JobResult(False, "fail", err)
             copy_file_local(src_local, dst_base, overwrite=overwrite)
-            return JobResult(True, "copy", f"not enough savings ({src_sz}->{out_sz}) -> copied original", dst_base, rel)
+            return JobResult(
+                True,
+                "copy",
+                f"not enough savings ({fmt_size_change(src_sz, out_sz)}) -> copied original",
+                dst_base,
+                rel,
+            )
 
-        return JobResult(True, "ok", f"{src_sz}->{out_sz}", out_final, out_final.relative_to(out_root).as_posix())
+        return JobResult(True, "ok", fmt_size_change(src_sz, out_sz), out_final, out_final.relative_to(out_root).as_posix())
 
     if info.kind == "audio":
         out_final = dst_base.with_suffix(".opus" if audio_policy != "always_copy" else src_local.suffix)
@@ -2593,9 +2693,15 @@ def process_one_local(
             if err:
                 return JobResult(False, "fail", err)
             copy_file_local(src_local, dst_base, overwrite=overwrite)
-            return JobResult(True, "copy", f"not enough savings ({src_sz}->{out_sz}) -> copied original", dst_base, rel)
+            return JobResult(
+                True,
+                "copy",
+                f"not enough savings ({fmt_size_change(src_sz, out_sz)}) -> copied original",
+                dst_base,
+                rel,
+            )
 
-        return JobResult(True, "ok", f"{src_sz}->{out_sz}", out_final, out_final.relative_to(out_root).as_posix())
+        return JobResult(True, "ok", fmt_size_change(src_sz, out_sz), out_final, out_final.relative_to(out_root).as_posix())
 
     if info.kind == "image":
         v = get_main_video_stream(info)
@@ -2629,9 +2735,15 @@ def process_one_local(
             if err:
                 return JobResult(False, "fail", err)
             copy_file_local(src_local, dst_base, overwrite=overwrite)
-            return JobResult(True, "copy", f"not enough savings ({src_sz}->{out_sz}) -> copied original", dst_base, rel)
+            return JobResult(
+                True,
+                "copy",
+                f"not enough savings ({fmt_size_change(src_sz, out_sz)}) -> copied original",
+                dst_base,
+                rel,
+            )
 
-        return JobResult(True, "ok", f"{src_sz}->{out_sz}", out_final, out_final.relative_to(out_root).as_posix())
+        return JobResult(True, "ok", fmt_size_change(src_sz, out_sz), out_final, out_final.relative_to(out_root).as_posix())
 
     dst = out_root / rel
     if dry_run:
@@ -2808,7 +2920,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    configure_logging(args.log_file, append=args.log_append)
+    configure_logging(
+        args.log_file,
+        append=args.log_append,
+        debug=bool(args.debug),
+        prefetch_debug=bool(args.prefetch_debug),
+    )
     # --help 已在 parse_args 内提前退出；放在这里确保显示帮助不依赖外部工具
     require_tools()
 
@@ -2967,12 +3084,12 @@ def main() -> None:
     coord = Coordinator(state_backend, lock_backend, device_id=device_id, ttl_sec=args.lock_ttl)
 
     def dbg(msg: str) -> None:
-        if args.debug:
-            log(f"[DEBUG] {msg}")
+        if _DEBUG_ENABLED:
+            _LOGGER.debug(msg)
 
     def pdebug(msg: str) -> None:
-        if args.prefetch_debug or args.debug:
-            log(f"[PREFETCH] {msg}")
+        if _PREFETCH_DEBUG_ENABLED or _DEBUG_ENABLED:
+            _LOGGER.debug(f"[PREFETCH] {msg}")
 
     stop_event = threading.Event()
     fatal_mu = threading.Lock()
@@ -3130,6 +3247,7 @@ def main() -> None:
 
     def scan_producer() -> None:
         nonlocal scan_total, scan_done, scan_proc, scan_enqueued, scan_error
+        dbg("scan thread start")
         try:
             for it in items_iter:
                 if stop_event.is_set():
@@ -3159,6 +3277,8 @@ def main() -> None:
                 set_fatal(e)
             stop_event.set()
         finally:
+            with scan_mu:
+                dbg(f"scan thread end total={scan_total} done={scan_done} processing={scan_proc} enqueued={scan_enqueued}")
             while True:
                 try:
                     work_q.put(None, timeout=0.2)
@@ -3208,6 +3328,7 @@ def main() -> None:
     def safe_append(status: str, it: WorkItem, *, dst_rel: Optional[str] = None) -> None:
         try:
             coord.append(status, it, dst_rel=dst_rel)
+            dbg(f"state {status} {it.rel} dst={dst_rel or ''}")
         except FatalAuthError:
             raise
         except Exception as e:
@@ -3232,6 +3353,7 @@ def main() -> None:
                 except Exception:
                     pass
             if not args.dry_run and not stop_event.is_set():
+                dbg(f"lock release (upload) {it.rel}")
                 coord.locks.release(it.rel)
             if upload_slots is not None:
                 try:
@@ -3335,6 +3457,7 @@ def main() -> None:
                 else:
                     local_out_root = out_root_local  # type: ignore
 
+                dbg(f"process {it.rel} src={local_src} out_root={local_out_root}")
                 jr = process_one_local(
                     local_src,
                     in_tmp_root,
@@ -3364,6 +3487,7 @@ def main() -> None:
                     rel_override=it.rel,
                     src_size_hint=it.src_size,
                 )
+                dbg(f"process result {it.rel} ok={jr.ok} action={jr.action} msg={jr.msg}")
 
                 if args.dry_run:
                     return StageResult(it, jr)
@@ -3378,6 +3502,7 @@ def main() -> None:
                     dst_path = remote_join(out_root_remote_path, jr.out_rel)
                     if upload_executor is not None and upload_dir is not None and upload_slots is not None:
                         defer_release = True
+                        dbg(f"upload enqueue {it.rel} -> {dst_path}")
                         return StageResult(it, jr, upload_dst_path=dst_path)
                     try:
                         dbg(f"upload {jr.out_local} -> {dst_path}")
@@ -3392,6 +3517,7 @@ def main() -> None:
 
         finally:
             if lock_acquired and not defer_release and not args.dry_run and not stop_event.is_set():
+                dbg(f"lock release {it.rel}")
                 coord.locks.release(it.rel)
 
     def finalize(it: WorkItem, jr: JobResult) -> None:
@@ -3635,6 +3761,9 @@ def main() -> None:
         scan_thread.join()
     except Exception:
         pass
+
+    with scan_mu:
+        log(f"Scan done: total={scan_total} done={scan_done} processing={scan_proc} enqueued={scan_enqueued}")
 
     raise_if_fatal()
 
