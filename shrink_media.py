@@ -192,6 +192,26 @@ def tail_text(s: str, n_lines: int = 40, max_chars: int = 6000) -> str:
     return tail[-max_chars:]
 
 
+def describe_returncode(rc: int) -> str:
+    if rc >= 0:
+        return f"exit={rc}"
+    sig = -rc
+    try:
+        name = signal.Signals(sig).name
+    except Exception:
+        name = f"SIG{sig}"
+    return f"killed by signal {sig} ({name})"
+
+
+def extract_result_from_ffmpeg_err(err: str) -> Optional[str]:
+    for line in (err or "").splitlines():
+        line = line.strip()
+        if not line.startswith("result:"):
+            continue
+        return line[len("result:") :].strip()
+    return None
+
+
 def sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
@@ -2166,6 +2186,8 @@ def build_video_cmd_single(
     v_stream = get_main_video_stream(info)
     v_codec_in = (v_stream.get("codec_name") or "").lower() if v_stream else ""
     src_pf = str(v_stream.get("pix_fmt")) if (v_stream and v_stream.get("pix_fmt")) else None
+    src_range = (v_stream.get("color_range") or "").strip().lower() if v_stream else ""
+    src_full_range = bool(src_range == "pc" or (src_pf or "").strip().lower().startswith("yuvj"))
 
     want_pix_retry = False
     retry_cmd: Optional[List[str]] = None
@@ -2202,6 +2224,10 @@ def build_video_cmd_single(
                 cmd += ["-pix_fmt", mapped]
                 if mapped != "yuv420p":
                     want_pix_retry = True
+
+        # yuvj*/pc(full-range) 来源若直接转成 yuv*，需要显式指定 range，否则可能出现亮度/对比度偏移。
+        if src_full_range:
+            cmd += ["-vf", "scale=in_range=pc:out_range=pc"]
 
         if container == "mp4":
             cmd += ["-tag:v", "hvc1"]
@@ -2272,7 +2298,7 @@ def build_video_candidates(
 ) -> List[List[str]]:
     cands: List[List[str]] = []
 
-    def add(enc: str) -> None:
+    def add(enc: str, *, preset_override: Optional[str] = None) -> None:
         cmd1, retry = build_video_cmd_single(
             in_path,
             out_path,
@@ -2283,7 +2309,7 @@ def build_video_candidates(
             allow_opus_in_mp4=allow_opus_in_mp4,
             encoder=enc,
             video_crf=video_crf,
-            video_preset=video_preset,
+            video_preset=preset_override or video_preset,
             pix_fmt=pix_fmt,
             faststart=faststart,
         )
@@ -2292,15 +2318,36 @@ def build_video_candidates(
             cands.append(retry)
 
     if video_encoder == "auto":
-        if has_encoder("hevc_nvenc"):
+        has_nvenc = has_encoder("hevc_nvenc")
+        has_x265 = has_encoder("libx265")
+        has_x264 = has_encoder("libx264")
+
+        if has_nvenc:
             add("hevc_nvenc")
-        add("libx265" if has_encoder("libx265") else "libx264")
-        if has_encoder("hevc_nvenc"):
-            add("libx265" if has_encoder("libx265") else "libx264")
+        if has_x265:
+            add("libx265")
+            if video_preset in {"slow", "slower", "veryslow"}:
+                add("libx265", preset_override="medium")
+        elif has_x264:
+            add("libx264")
+
+        # 最后兜底：当 x265/NVENC 失败时仍尝试 x264（除非强制 always_hevc）。
+        if video_policy != "always_hevc" and has_x264:
+            add("libx264")
     else:
         add(video_encoder)
         if video_encoder == "hevc_nvenc":
-            add("libx265" if has_encoder("libx265") else "libx264")
+            if has_encoder("libx265"):
+                add("libx265")
+                if video_preset in {"slow", "slower", "veryslow"}:
+                    add("libx265", preset_override="medium")
+            if video_policy != "always_hevc" and has_encoder("libx264"):
+                add("libx264")
+        if video_encoder == "libx265":
+            if video_preset in {"slow", "slower", "veryslow"}:
+                add("libx265", preset_override="medium")
+            if video_policy != "always_hevc" and has_encoder("libx264"):
+                add("libx264")
 
     # 去重
     seen = set()
@@ -2561,7 +2608,10 @@ def run_ffmpeg_with_candidates(
                     out_tmp.unlink()
             except Exception:
                 pass
-            last_err = tail_text(cp.stderr, n_lines=60, max_chars=6000)
+            cmd_s = shlex.join(cmd2)
+            rc_s = describe_returncode(cp.returncode)
+            stderr_tail = tail_text(cp.stderr, n_lines=60, max_chars=6000)
+            last_err = f"cmd: {cmd_s}\nresult: {rc_s}\n{stderr_tail}".strip()
             if _DEBUG_ENABLED:
                 _LOGGER.debug("ffmpeg fail %d/%d exit=%d: %s", idx + 1, len(candidates), cp.returncode, last_err)
 
@@ -3077,7 +3127,20 @@ def process_one_local(
         )
         ok, err, wrote = run_ffmpeg_with_candidates(candidates, out_final, overwrite=overwrite, dry_run=dry_run)
         if not ok:
-            return JobResult(False, "fail", f"ffmpeg failed:\\n{err}")
+            if dry_run:
+                return JobResult(True, "dry-run", "ffmpeg failed -> would copy", None, rel)
+            try:
+                if overwrite and out_final.exists():
+                    out_final.unlink()
+            except Exception:
+                pass
+            err2 = ensure_local()
+            if err2:
+                return JobResult(False, "fail", err2)
+            copy_file_local(src_local, dst_base, overwrite=overwrite)
+            rc = extract_result_from_ffmpeg_err(err)
+            msg = f"ffmpeg failed ({rc}) -> copied original" if rc else "ffmpeg failed -> copied original"
+            return JobResult(True, "copy", msg, dst_base, rel)
         if dry_run:
             return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
         if not wrote:
@@ -3120,7 +3183,20 @@ def process_one_local(
 
         ok, err, wrote = run_ffmpeg_with_candidates(cmds, out_final, overwrite=overwrite, dry_run=dry_run)
         if not ok:
-            return JobResult(False, "fail", f"ffmpeg failed:\\n{err}")
+            if dry_run:
+                return JobResult(True, "dry-run", "ffmpeg failed -> would copy", None, rel)
+            try:
+                if overwrite and out_final.exists():
+                    out_final.unlink()
+            except Exception:
+                pass
+            err2 = ensure_local()
+            if err2:
+                return JobResult(False, "fail", err2)
+            copy_file_local(src_local, dst_base, overwrite=overwrite)
+            rc = extract_result_from_ffmpeg_err(err)
+            msg = f"ffmpeg failed ({rc}) -> copied original" if rc else "ffmpeg failed -> copied original"
+            return JobResult(True, "copy", msg, dst_base, rel)
         if dry_run:
             return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
         if not wrote:
@@ -3166,7 +3242,20 @@ def process_one_local(
         )
         ok, err, wrote = run_ffmpeg_with_candidates(candidates, out_final, overwrite=overwrite, dry_run=dry_run)
         if not ok:
-            return JobResult(False, "fail", f"ffmpeg failed:\\n{err}")
+            if dry_run:
+                return JobResult(True, "dry-run", "ffmpeg failed -> would copy", None, rel)
+            try:
+                if overwrite and out_final.exists():
+                    out_final.unlink()
+            except Exception:
+                pass
+            err2 = ensure_local()
+            if err2:
+                return JobResult(False, "fail", err2)
+            copy_file_local(src_local, dst_base, overwrite=overwrite)
+            rc = extract_result_from_ffmpeg_err(err)
+            msg = f"ffmpeg failed ({rc}) -> copied original" if rc else "ffmpeg failed -> copied original"
+            return JobResult(True, "copy", msg, dst_base, rel)
         if dry_run:
             return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
         if not wrote:
@@ -3654,7 +3743,10 @@ def main() -> None:
                     prefetch_futs.pop(it.rel, None)
                     claimed = it.rel in prefetch_claimed
                     prefetch_claimed.discard(it.rel)
-                    if (not claimed) and (len(prefetch_results) < max_cached):
+                    if claimed:
+                        # Worker 正在等待/消费该 future；文件由 worker 负责清理，避免提前 unlink 导致 copy2 源文件丢失。
+                        pass
+                    elif len(prefetch_results) < max_cached:
                         prefetch_results[it.rel] = res
                     elif res[0] and res[1] is not None:
                         try:
@@ -3881,25 +3973,34 @@ def main() -> None:
                         ok_dl, path_dl, err = res
                         if args.prefetch_debug:
                             pdebug(f"use {'hit' if ok_dl else 'miss'} {it.rel}")
-                        if ok_dl and path_dl is not None:
+                        if ok_dl and path_dl is not None and path_dl.exists():
+                            try:
+                                ensure_parent(local_src)
+                                dbg(f"prefetch copy {path_dl} -> {local_src}")
+                                shutil.copy2(path_dl, local_src)
+                                if size_of(local_src) != it.src_size:
+                                    dbg(f"size mismatch; re-download {it.remote_path}")
+                                    remote_client.download_to(it.remote_path, local_src)
                                 try:
-                                    ensure_parent(local_src)
-                                    dbg(f"prefetch copy {path_dl} -> {local_src}")
-                                    shutil.copy2(path_dl, local_src)
-                                    if size_of(local_src) != it.src_size:
-                                        dbg(f"size mismatch; re-download {it.remote_path}")
-                                        remote_client.download_to(it.remote_path, local_src)
-                                    try:
-                                        path_dl.unlink(missing_ok=True)  # cleanup consumed prefetch
-                                    except Exception:
-                                        pass
+                                    path_dl.unlink(missing_ok=True)  # cleanup consumed prefetch
+                                except Exception:
+                                    pass
+                            except FatalAuthError:
+                                raise
+                            except FileNotFoundError:
+                                # 预取文件可能被清理/丢失（例如并发消费）；回退为直接下载而不是失败。
+                                try:
+                                    dbg(f"prefetch vanished -> download {it.remote_path}")
+                                    remote_client.download_to(it.remote_path, local_src)
                                 except FatalAuthError:
                                     raise
                                 except Exception as e:
-                                    return StageResult(it, JobResult(False, "fail", f"prefetch copy failed: {e}"))
+                                    return StageResult(it, JobResult(False, "fail", f"prefetch vanished+download failed: {e}"))
+                            except Exception as e:
+                                return StageResult(it, JobResult(False, "fail", f"prefetch copy failed: {e}"))
                         else:
                             try:
-                                dbg(f"prefetch miss -> download {it.remote_path}")
+                                dbg(f"prefetch miss/stale -> download {it.remote_path}")
                                 remote_client.download_to(it.remote_path, local_src)
                             except FatalAuthError:
                                 raise
