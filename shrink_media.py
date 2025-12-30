@@ -50,7 +50,7 @@ import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -905,9 +905,148 @@ class WorkItem:
     remote_path: Optional[str] = None
     src_size: int = 0
     src_mtime_ns: int = 0
+    out_rel_override: Optional[str] = None
 
 
-def iter_local_inputs(input_path: Path) -> Tuple[Path, Iterator[WorkItem]]:
+def compute_image_out_name_overrides(names: Sequence[str], *, image_target_ext: str) -> Dict[str, str]:
+    """
+    给同一目录下的图片文件名做“仅在撞名时”的输出名改写。
+
+    规则：
+    - 默认：1.jpg/1.png -> 1.webp（或 1.avif）
+    - 如果同目录内多个源文件会映射到同一个目标名（例如 1.jpg + 1.png -> 1.webp），
+      则对这些需要转码的源文件输出名改为：1__jpg.webp / 1__png.webp（必要时再加 __2/__3...）
+    - 若同目录已经存在目标扩展（例如已有 1.webp），保留该文件名不改，对其他冲突源改名。
+
+    返回：{src_name: out_name}，仅包含“需要改名”的源文件。
+    """
+    target_ext = image_target_ext.lower()
+    if not target_ext.startswith("."):
+        target_ext = "." + target_ext
+
+    img_names = [n for n in names if Path(n).suffix.lower() in IMAGE_EXTS]
+    if len(img_names) <= 1:
+        return {}
+
+    # default target name (after conversion/copy semantics for images)
+    groups: Dict[str, List[str]] = {}
+    for n in img_names:
+        ext = Path(n).suffix.lower()
+        out = n if ext == target_ext else Path(n).with_suffix(target_ext).name
+        groups.setdefault(out, []).append(n)
+
+    need: set[str] = set()
+    for out, srcs in groups.items():
+        if len(srcs) <= 1:
+            continue
+        keep = out if out in srcs else None
+        for s in srcs:
+            if keep and s == keep:
+                continue
+            need.add(s)
+
+    if not need:
+        return {}
+
+    reserved: set[str] = set()
+    for n in sorted(img_names):
+        if n in need:
+            continue
+        ext = Path(n).suffix.lower()
+        out = n if ext == target_ext else Path(n).with_suffix(target_ext).name
+        reserved.add(out)
+
+    overrides: Dict[str, str] = {}
+    for n in sorted(need):
+        p = Path(n)
+        stem = p.stem
+        src_ext = p.suffix.lower().lstrip(".") or "src"
+        base = f"{stem}__{src_ext}{target_ext}"
+        cand = base
+        if cand in reserved:
+            for i in range(2, 10000):
+                cand2 = f"{stem}__{src_ext}__{i}{target_ext}"
+                if cand2 not in reserved:
+                    cand = cand2
+                    break
+        reserved.add(cand)
+        overrides[n] = cand
+
+    return overrides
+
+
+def compute_output_name_overrides(
+    names: Sequence[str],
+    *,
+    out_name_of: Callable[[str], Optional[str]],
+) -> Dict[str, str]:
+    """
+    通用“仅在撞名时”的输出名改写（按目录内文件名）。
+
+    - out_name_of(name) 返回该源文件的默认输出文件名（仅文件名，不含路径）；返回 None 表示不参与撞名检测。
+    - 若多个源文件会产生相同 out_name，则保留其中一个不改名（优先保留“源文件名就等于 out_name”的那个），
+      其余改为：<stem>__<src_ext><target_ext>（必要时追加 __2/__3...）。
+
+    返回：{src_name: out_name}，仅包含“需要改名”的源文件。
+    """
+    out_by_name: Dict[str, str] = {}
+    groups: Dict[str, List[str]] = {}
+    for n in names:
+        out = out_name_of(n)
+        if not out:
+            continue
+        out_by_name[n] = out
+        groups.setdefault(out, []).append(n)
+
+    if not groups:
+        return {}
+
+    need: set[str] = set()
+    for out, srcs in groups.items():
+        if len(srcs) <= 1:
+            continue
+        keep = out if out in srcs else sorted(srcs)[0]
+        for s in srcs:
+            if s == keep:
+                continue
+            need.add(s)
+
+    if not need:
+        return {}
+
+    reserved: set[str] = set()
+    for s, out in out_by_name.items():
+        if s in need:
+            continue
+        reserved.add(out)
+
+    overrides: Dict[str, str] = {}
+    for s in sorted(need):
+        out = out_by_name.get(s)
+        if not out:
+            continue
+        target_ext = Path(out).suffix.lower() or ""
+        if not target_ext.startswith("."):
+            target_ext = "." + target_ext if target_ext else ""
+        stem = Path(s).stem
+        src_ext = Path(s).suffix.lower().lstrip(".") or "src"
+        base = f"{stem}__{src_ext}{target_ext}"
+        cand = base
+        if cand in reserved:
+            for i in range(2, 10000):
+                cand2 = f"{stem}__{src_ext}__{i}{target_ext}"
+                if cand2 not in reserved:
+                    cand = cand2
+                    break
+        reserved.add(cand)
+        overrides[s] = cand
+
+    return overrides
+
+
+def iter_local_inputs(
+    input_path: Path, *, image_codec: str = "webp", container: str = "auto", audio_policy: str = "copy_if_lossy"
+) -> Tuple[Path, Iterator[WorkItem]]:
     if input_path.is_file():
         st = input_path.stat()
         root = input_path.parent
@@ -930,6 +1069,70 @@ def iter_local_inputs(input_path: Path) -> Tuple[Path, Iterator[WorkItem]]:
             children = sorted(d.iterdir(), key=lambda p: p.name)
         except Exception:
             return
+        image_target_ext = ".webp" if image_codec == "webp" else ".avif"
+        audio_target_ext = ".opus" if audio_policy != "always_copy" else ""
+        baseline_video_ext = ".mkv" if container == "mkv" else ".mp4"
+        file_names: List[str] = []
+        rel_by_name: Dict[str, str] = {}
+        file_by_name: Dict[str, Path] = {}
+        for p in children:
+            name = p.name
+            if should_ignore_name(name):
+                continue
+            if p.is_file():
+                rel = p.relative_to(root).as_posix()
+                if rel.startswith(LOCKS_DIR_NAME + "/") or rel.startswith(STATE_DIR_NAME + "/"):
+                    continue
+                file_names.append(name)
+                rel_by_name[name] = rel
+                file_by_name[name] = p
+
+        video_target_ext_by_name: Dict[str, str] = {}
+        video_names = [
+            n
+            for n in file_names
+            if (Path(n).suffix.lower() in VIDEO_EXTS) or (Path(n).suffix.lower() in ANIMATED_IMAGE_EXTS)
+        ]
+        for n in video_names:
+            video_target_ext_by_name[n] = baseline_video_ext
+
+        # container=auto/mp4 时，部分视频可能因为字幕兼容性而从 mp4 自动切到 mkv；仅在“潜在撞名”的 stem 组里探测，避免无谓 ffprobe。
+        if baseline_video_ext == ".mp4" and video_names:
+            tmp_groups: Dict[str, List[str]] = {}
+            for n in video_names:
+                ext = Path(n).suffix.lower()
+                out = n if ext == ".mp4" else Path(n).with_suffix(".mp4").name
+                tmp_groups.setdefault(out, []).append(n)
+            need_probe: set[str] = set()
+            for _out, srcs in tmp_groups.items():
+                if len(srcs) > 1:
+                    need_probe.update(srcs)
+            for n in sorted(need_probe):
+                p = file_by_name.get(n)
+                if not p:
+                    continue
+                probe = ffprobe_json(p, dry_run=False)
+                info = classify(p, probe)
+                has_subs, mp4_sub_ok = detect_subtitle_compat(info.streams)
+                if has_subs and not mp4_sub_ok:
+                    video_target_ext_by_name[n] = ".mkv"
+
+        def _out_name_of(n: str) -> Optional[str]:
+            ext = Path(n).suffix.lower()
+            if ext in IMAGE_EXTS:
+                return n if ext == image_target_ext else Path(n).with_suffix(image_target_ext).name
+            if ext in AUDIO_EXTS and audio_target_ext:
+                return n if ext == audio_target_ext else Path(n).with_suffix(audio_target_ext).name
+            if ext in VIDEO_EXTS or ext in ANIMATED_IMAGE_EXTS:
+                vext = video_target_ext_by_name.get(n)
+                if not vext:
+                    return None
+                return n if ext == vext else Path(n).with_suffix(vext).name
+            if ext in COMIC_EXTS or looks_like_archive_name(n):
+                return n if ext == ".cbz" else Path(n).with_suffix(".cbz").name
+            return None
+
+        out_overrides = compute_output_name_overrides(file_names, out_name_of=_out_name_of)
         for p in children:
             name = p.name
             if should_ignore_name(name):
@@ -941,41 +1144,143 @@ def iter_local_inputs(input_path: Path) -> Tuple[Path, Iterator[WorkItem]]:
                 continue
             if not p.is_file():
                 continue
-            rel = p.relative_to(root).as_posix()
-            if rel.startswith(LOCKS_DIR_NAME + "/") or rel.startswith(STATE_DIR_NAME + "/"):
+            rel = rel_by_name.get(name)
+            if not rel:
                 continue
             try:
                 st = p.stat()
             except Exception:
                 continue
+            out_rel_override = None
+            ov = out_overrides.get(name)
+            if ov:
+                out_rel_override = Path(rel).with_name(ov).as_posix()
             yield WorkItem(
                 rel=rel,
                 is_remote=False,
                 src_local=p,
                 src_size=int(st.st_size),
                 src_mtime_ns=int(st.st_mtime_ns),
+                out_rel_override=out_rel_override,
             )
 
     return root, _walk_dir(root)
 
 
-def iter_remote_inputs(client: OpenListClientSync, root_path: str) -> Tuple[str, Iterator[WorkItem]]:
+def iter_remote_inputs(
+    client: OpenListClientSync,
+    root_path: str,
+    *,
+    image_codec: str = "webp",
+    container: str = "auto",
+    audio_policy: str = "copy_if_lossy",
+) -> Tuple[str, Iterator[WorkItem]]:
     root_norm = root_path.rstrip("/") or "/"
+    image_target_ext = ".webp" if image_codec == "webp" else ".avif"
+    audio_target_ext = ".opus" if audio_policy != "always_copy" else ""
+    baseline_video_ext = ".mkv" if container == "mkv" else ".mp4"
 
     def _gen() -> Iterator[WorkItem]:
-        for e in iter_openlist_recursive(client, root_norm):
-            name = Path(e.rel).name
-            if should_ignore_name(name):
-                continue
-            if e.rel.startswith(LOCKS_DIR_NAME + "/") or e.rel.startswith(STATE_DIR_NAME + "/"):
-                continue
+        try:
+            root_info = client.info(root_norm)
+        except FatalAuthError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"remote info failed: {e}") from e
+
+        if not getattr(root_info, "is_dir", False):
+            rel0 = posixpath.basename(root_norm)
+            if should_ignore_name(rel0):
+                return
             yield WorkItem(
-                rel=e.rel,
+                rel=rel0,
                 is_remote=True,
-                remote_path=e.path,
-                src_size=e.size,
-                src_mtime_ns=e.mtime_ns,
+                remote_path=root_norm,
+                src_size=int(getattr(root_info, "size", 0) or 0),
+                src_mtime_ns=_mtime_to_ns(getattr(root_info, "modified", None)),
             )
+            return
+
+        def walk(cur: str) -> Iterator[WorkItem]:
+            dirs: List[str] = []
+            files: List[Tuple[str, str, int, int, str]] = []  # (name, child_path, size, mtime_ns, sign)
+            page = 1
+            got = 0
+            while True:
+                res = client.listdir(cur, refresh=True, per_page=100, page=page)
+                content = getattr(res, "content", []) or []
+                for obj in content:
+                    name = str(getattr(obj, "name", "") or "")
+                    if not name or should_ignore_name(name):
+                        continue
+                    child_path = posixpath.join(cur, name)
+                    is_dir = bool(getattr(obj, "is_dir", False))
+                    if is_dir:
+                        if name in {LOCKS_DIR_NAME, STATE_DIR_NAME}:
+                            continue
+                        dirs.append(child_path)
+                        continue
+                    rel = posixpath.relpath(child_path, root_norm).replace("\\", "/")
+                    if rel.startswith(LOCKS_DIR_NAME + "/") or rel.startswith(STATE_DIR_NAME + "/"):
+                        continue
+                    files.append(
+                        (
+                            name,
+                            child_path,
+                            int(getattr(obj, "size", 0) or 0),
+                            _mtime_to_ns(getattr(obj, "modified", None)),
+                            str(getattr(obj, "sign", "") or ""),
+                        )
+                    )
+                got += len(content)
+                total = int(getattr(res, "total", 0) or 0)
+                if not content or (total > 0 and got >= total):
+                    break
+                page += 1
+
+            names = [n for (n, *_rest) in files]
+            video_target_ext_by_name: Dict[str, str] = {}
+            for n in names:
+                ext = Path(n).suffix.lower()
+                if ext in VIDEO_EXTS or ext in ANIMATED_IMAGE_EXTS:
+                    video_target_ext_by_name[n] = baseline_video_ext
+
+            def _out_name_of(n: str) -> Optional[str]:
+                ext = Path(n).suffix.lower()
+                if ext in IMAGE_EXTS:
+                    return n if ext == image_target_ext else Path(n).with_suffix(image_target_ext).name
+                if ext in AUDIO_EXTS and audio_target_ext:
+                    return n if ext == audio_target_ext else Path(n).with_suffix(audio_target_ext).name
+                if ext in VIDEO_EXTS or ext in ANIMATED_IMAGE_EXTS:
+                    vext = video_target_ext_by_name.get(n)
+                    if not vext:
+                        return None
+                    return n if ext == vext else Path(n).with_suffix(vext).name
+                if ext in COMIC_EXTS or looks_like_archive_name(n):
+                    return n if ext == ".cbz" else Path(n).with_suffix(".cbz").name
+                return None
+
+            out_overrides = compute_output_name_overrides(names, out_name_of=_out_name_of)
+
+            for name, child_path, size, mtime_ns, sign in sorted(files, key=lambda x: x[0]):
+                rel = posixpath.relpath(child_path, root_norm).replace("\\", "/")
+                out_rel_override = None
+                ov = out_overrides.get(name)
+                if ov:
+                    out_rel_override = Path(rel).with_name(ov).as_posix()
+                yield WorkItem(
+                    rel=rel,
+                    is_remote=True,
+                    remote_path=child_path,
+                    src_size=size,
+                    src_mtime_ns=mtime_ns,
+                    out_rel_override=out_rel_override,
+                )
+
+            for d2 in sorted(dirs):
+                yield from walk(d2)
+
+        yield from walk(root_norm)
 
     return root_norm, _gen()
 
@@ -2102,14 +2407,14 @@ def run_ffmpeg_with_candidates(
     *,
     overwrite: bool,
     dry_run: bool,
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, bool]:
     if dry_run:
         for c in candidates:
             log("[dry-run] " + " ".join(c))
-        return True, "dry-run"
+        return True, "dry-run", False
 
     if out_final.exists() and not overwrite:
-        return True, f"output exists: {out_final}"
+        return True, f"output exists: {out_final}", False
 
     if _DEBUG_ENABLED:
         _LOGGER.debug("ffmpeg candidates=%d out=%s", len(candidates), out_final)
@@ -2154,17 +2459,17 @@ def run_ffmpeg_with_candidates(
                             out_tmp.unlink()
                         except Exception:
                             pass
-                        return True, f"output exists: {out_final}"
+                        return True, f"output exists: {out_final}", False
                 ensure_parent(out_final)
                 out_tmp.replace(out_final)
-                return True, "ok"
+                return True, "ok", True
             except Exception as e:
                 try:
                     if out_tmp.exists():
                         out_tmp.unlink()
                 except Exception:
                     pass
-                return False, f"rename failed: {e}"
+                return False, f"rename failed: {e}", False
         else:
             try:
                 if out_tmp.exists():
@@ -2175,7 +2480,7 @@ def run_ffmpeg_with_candidates(
             if _DEBUG_ENABLED:
                 _LOGGER.debug("ffmpeg fail %d/%d exit=%d: %s", idx + 1, len(candidates), cp.returncode, last_err)
 
-    return False, (last_err or "ffmpeg failed")
+    return False, (last_err or "ffmpeg failed"), False
 
 
 # ------------------------
@@ -2338,6 +2643,24 @@ def process_comic_to_cbz(
 
         img_files_sorted = sorted(img_files, key=lambda p: natural_key(str(p.relative_to(extracted))))
 
+        # 同一目录内若存在 1.jpg + 1.png 这类“转码后同名”的情况，避免覆盖：
+        # - 默认：1.jpg/1.png -> 1.webp
+        # - 撞名时：1__jpg.webp / 1__png.webp（必要时加 __2/__3...）
+        folder_overrides: Dict[Path, Dict[str, str]] = {}
+        folder_names: Dict[Path, List[str]] = {}
+        for p in img_files_sorted:
+            ext = p.suffix.lower()
+            if ext in ANIMATED_IMAGE_EXTS:
+                continue
+            if ext not in IMAGE_EXTS:
+                continue
+            rel = p.relative_to(extracted)
+            folder_names.setdefault(rel.parent, []).append(rel.name)
+        for parent, names in folder_names.items():
+            ov = compute_image_out_name_overrides(names, image_target_ext=target_ext)
+            if ov:
+                folder_overrides[parent] = ov
+
         for p in img_files_sorted:
             rel = p.relative_to(extracted)
             ext = p.suffix.lower()
@@ -2350,7 +2673,13 @@ def process_comic_to_cbz(
                 files_to_zip.append((p, str(rel)))
                 continue
 
-            out_img = (converted / rel).with_suffix(target_ext)
+            out_rel = rel.with_suffix(target_ext)
+            ov = folder_overrides.get(rel.parent)
+            if ov:
+                out_name = ov.get(rel.name)
+                if out_name:
+                    out_rel = rel.with_name(out_name)
+            out_img = converted / out_rel
             ensure_parent(out_img)
 
             candidates = build_image_candidates(
@@ -2363,12 +2692,12 @@ def process_comic_to_cbz(
                 avif_pix_fmt=avif_pix_fmt,
                 src_pix_fmt=None,
             )
-            ok, _err = run_ffmpeg_with_candidates(candidates, out_img, overwrite=True, dry_run=dry_run)
+            ok, _err, _wrote = run_ffmpeg_with_candidates(candidates, out_img, overwrite=True, dry_run=dry_run)
             if not ok:
                 files_to_zip.append((p, str(rel)))
                 continue
 
-            files_to_zip.append((out_img, str(rel.with_suffix(target_ext))))
+            files_to_zip.append((out_img, str(out_rel)))
 
         if dry_run:
             log("[dry-run] would create " + str(out_cbz))
@@ -2470,10 +2799,24 @@ def process_one_local(
     comic_accept_bigger: bool,
     archive_password: Optional[str],
     rel_override: Optional[str] = None,
+    out_rel_override: Optional[str] = None,
     src_size_hint: int = 0,
 ) -> JobResult:
     rel = rel_override or src_local.relative_to(in_root).as_posix()
     src_arg = str(src_local)
+
+    def apply_out_override(p: Path) -> Path:
+        if not out_rel_override:
+            return p
+        try:
+            ov = Path(out_rel_override)
+            if ov.is_absolute() or (".." in ov.parts):
+                return p
+            if ov.suffix.lower() != p.suffix.lower():
+                return p
+            return out_root / ov
+        except Exception:
+            return p
 
     def ensure_local() -> Optional[str]:
         if src_local.exists():
@@ -2523,6 +2866,7 @@ def process_one_local(
 
         target_ext = ".webp" if image_codec == "webp" else ".avif"
         dst_cbz = (out_root / rel).with_suffix(".cbz")
+        dst_cbz = apply_out_override(dst_cbz)
 
         # smart-skip
         try:
@@ -2622,6 +2966,7 @@ def process_one_local(
         if container2 == "mp4" and has_subs and not mp4_sub_ok:
             container2 = "mkv"
         out_final = dst_base.with_suffix("." + container2)
+        out_final = apply_out_override(out_final)
 
         candidates = build_video_candidates(
             src_arg,
@@ -2637,11 +2982,13 @@ def process_one_local(
             pix_fmt=pix_fmt,
             faststart=faststart,
         )
-        ok, err = run_ffmpeg_with_candidates(candidates, out_final, overwrite=overwrite, dry_run=dry_run)
+        ok, err, wrote = run_ffmpeg_with_candidates(candidates, out_final, overwrite=overwrite, dry_run=dry_run)
         if not ok:
             return JobResult(False, "fail", f"ffmpeg failed:\\n{err}")
         if dry_run:
             return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
+        if not wrote:
+            return JobResult(True, "copy", f"output exists -> kept: {out_final}", out_final, out_final.relative_to(out_root).as_posix())
 
         src_sz = src_size_val()
         out_sz = size_of(out_final)
@@ -2666,6 +3013,7 @@ def process_one_local(
 
     if info.kind == "audio":
         out_final = dst_base.with_suffix(".opus" if audio_policy != "always_copy" else src_local.suffix)
+        out_final = apply_out_override(out_final)
         cmds = build_audio_candidates(src_arg, out_final, info, audio_policy=audio_policy)
         if not cmds:
             if dry_run:
@@ -2676,11 +3024,13 @@ def process_one_local(
             copy_file_local(src_local, dst_base, overwrite=overwrite)
             return JobResult(True, "copy", "no audio stream -> copied", dst_base, rel)
 
-        ok, err = run_ffmpeg_with_candidates(cmds, out_final, overwrite=overwrite, dry_run=dry_run)
+        ok, err, wrote = run_ffmpeg_with_candidates(cmds, out_final, overwrite=overwrite, dry_run=dry_run)
         if not ok:
             return JobResult(False, "fail", f"ffmpeg failed:\\n{err}")
         if dry_run:
             return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
+        if not wrote:
+            return JobResult(True, "copy", f"output exists -> kept: {out_final}", out_final, out_final.relative_to(out_root).as_posix())
 
         src_sz = src_size_val()
         out_sz = size_of(out_final)
@@ -2707,6 +3057,7 @@ def process_one_local(
         v = get_main_video_stream(info)
         src_pf = str(v.get("pix_fmt")) if (v and v.get("pix_fmt")) else None
         out_final = dst_base.with_suffix(image_target_ext)
+        out_final = apply_out_override(out_final)
 
         candidates = build_image_candidates(
             src_arg,
@@ -2718,11 +3069,13 @@ def process_one_local(
             avif_pix_fmt=avif_pix_fmt,
             src_pix_fmt=src_pf,
         )
-        ok, err = run_ffmpeg_with_candidates(candidates, out_final, overwrite=overwrite, dry_run=dry_run)
+        ok, err, wrote = run_ffmpeg_with_candidates(candidates, out_final, overwrite=overwrite, dry_run=dry_run)
         if not ok:
             return JobResult(False, "fail", f"ffmpeg failed:\\n{err}")
         if dry_run:
             return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
+        if not wrote:
+            return JobResult(True, "copy", f"output exists -> kept: {out_final}", out_final, out_final.relative_to(out_root).as_posix())
 
         src_sz = src_size_val()
         out_sz = size_of(out_final)
@@ -2974,7 +3327,13 @@ def main() -> None:
             log_err("ERROR: OpenList 输入需要远端客户端。")
             sys.exit(2)
         in_base, in_root_remote_path = parse_remote_location(args.input)
-        in_root_remote_path, items_iter = iter_remote_inputs(remote_client, in_root_remote_path)
+        in_root_remote_path, items_iter = iter_remote_inputs(
+            remote_client,
+            in_root_remote_path,
+            image_codec=args.image_codec,
+            container=args.container,
+            audio_policy=args.audio_policy,
+        )
         in_root_local: Optional[Path] = None
         in_root_display = f"{in_base}{in_root_remote_path}"
     else:
@@ -2982,7 +3341,12 @@ def main() -> None:
         if not in_path.exists():
             log_err("ERROR: 输入路径不存在。")
             sys.exit(2)
-        in_root_local, items_iter = iter_local_inputs(in_path)
+        in_root_local, items_iter = iter_local_inputs(
+            in_path,
+            image_codec=args.image_codec,
+            container=args.container,
+            audio_policy=args.audio_policy,
+        )
         in_root_remote_path = None
         in_root_display = str(in_root_local)
 
@@ -3485,6 +3849,7 @@ def main() -> None:
                     comic_accept_bigger=args.comic_accept_bigger,
                     archive_password=args.archive_password,
                     rel_override=it.rel,
+                    out_rel_override=it.out_rel_override,
                     src_size_hint=it.src_size,
                 )
                 dbg(f"process result {it.rel} ok={jr.ok} action={jr.action} msg={jr.msg}")
