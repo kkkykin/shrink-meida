@@ -908,21 +908,58 @@ class WorkItem:
     out_rel_override: Optional[str] = None
 
 
-def compute_image_out_name_overrides(names: Sequence[str], *, image_target_ext: str) -> Dict[str, str]:
+def normalize_ext(ext: str) -> str:
+    ext = (ext or "").strip().lower()
+    if not ext:
+        return ""
+    return ext if ext.startswith(".") else "." + ext
+
+
+def build_suffixed_target_name(src_name: str, *, target_ext: str) -> str:
+    p = Path(src_name)
+    stem = p.stem
+    src_ext = p.suffix.lower().lstrip(".") or "src"
+    return f"{stem}__{src_ext}{normalize_ext(target_ext)}"
+
+
+def apply_out_name_mode(p: Path, *, src_rel: str, target_ext: str, out_name_mode: str) -> Path:
+    """
+    根据 out_name_mode 改写输出路径的“文件名”：
+    - collision：默认保持 <stem><target_ext>（靠外层的 compute_output_name_overrides 仅在撞名时用 out_rel_override 修正）
+    - suffix：当 target_ext != src_ext 时，输出名改为 <stem>__<src_ext><target_ext>
+    """
+    if out_name_mode != "suffix":
+        return p
+    target_ext2 = normalize_ext(target_ext)
+    if not target_ext2:
+        return p
+    src_p = Path(src_rel)
+    if src_p.suffix.lower() == target_ext2:
+        return p
+    return p.with_name(build_suffixed_target_name(src_p.name, target_ext=target_ext2))
+
+
+def compute_image_out_name_overrides(
+    names: Sequence[str],
+    *,
+    image_target_ext: str,
+    out_name_mode: str,
+) -> Dict[str, str]:
     """
     给同一目录下的图片文件名做“仅在撞名时”的输出名改写。
 
     规则：
-    - 默认：1.jpg/1.png -> 1.webp（或 1.avif）
+    - collision：1.jpg/1.png -> 1.webp（或 1.avif）
+    - suffix：1.jpg/1.png -> 1__jpg.webp / 1__png.webp（或 .avif）
     - 如果同目录内多个源文件会映射到同一个目标名（例如 1.jpg + 1.png -> 1.webp），
       则对这些需要转码的源文件输出名改为：1__jpg.webp / 1__png.webp（必要时再加 __2/__3...）
     - 若同目录已经存在目标扩展（例如已有 1.webp），保留该文件名不改，对其他冲突源改名。
 
     返回：{src_name: out_name}，仅包含“需要改名”的源文件。
     """
-    target_ext = image_target_ext.lower()
-    if not target_ext.startswith("."):
-        target_ext = "." + target_ext
+    target_ext = normalize_ext(image_target_ext)
+    if not target_ext:
+        return {}
 
     img_names = [n for n in names if Path(n).suffix.lower() in IMAGE_EXTS]
     if len(img_names) <= 1:
@@ -932,7 +969,12 @@ def compute_image_out_name_overrides(names: Sequence[str], *, image_target_ext: 
     groups: Dict[str, List[str]] = {}
     for n in img_names:
         ext = Path(n).suffix.lower()
-        out = n if ext == target_ext else Path(n).with_suffix(target_ext).name
+        if ext == target_ext:
+            out = n
+        elif out_name_mode == "suffix":
+            out = build_suffixed_target_name(n, target_ext=target_ext)
+        else:
+            out = Path(n).with_suffix(target_ext).name
         groups.setdefault(out, []).append(n)
 
     need: set[str] = set()
@@ -953,7 +995,12 @@ def compute_image_out_name_overrides(names: Sequence[str], *, image_target_ext: 
         if n in need:
             continue
         ext = Path(n).suffix.lower()
-        out = n if ext == target_ext else Path(n).with_suffix(target_ext).name
+        if ext == target_ext:
+            out = n
+        elif out_name_mode == "suffix":
+            out = build_suffixed_target_name(n, target_ext=target_ext)
+        else:
+            out = Path(n).with_suffix(target_ext).name
         reserved.add(out)
 
     overrides: Dict[str, str] = {}
@@ -1045,7 +1092,12 @@ def compute_output_name_overrides(
 
 
 def iter_local_inputs(
-    input_path: Path, *, image_codec: str = "webp", container: str = "auto", audio_policy: str = "copy_if_lossy"
+    input_path: Path,
+    *,
+    image_codec: str = "webp",
+    container: str = "auto",
+    audio_policy: str = "copy_if_lossy",
+    out_name_mode: str = "suffix",
 ) -> Tuple[Path, Iterator[WorkItem]]:
     if input_path.is_file():
         st = input_path.stat()
@@ -1097,7 +1149,7 @@ def iter_local_inputs(
             video_target_ext_by_name[n] = baseline_video_ext
 
         # container=auto/mp4 时，部分视频可能因为字幕兼容性而从 mp4 自动切到 mkv；仅在“潜在撞名”的 stem 组里探测，避免无谓 ffprobe。
-        if baseline_video_ext == ".mp4" and video_names:
+        if out_name_mode == "collision" and baseline_video_ext == ".mp4" and video_names:
             tmp_groups: Dict[str, List[str]] = {}
             for n in video_names:
                 ext = Path(n).suffix.lower()
@@ -1120,16 +1172,32 @@ def iter_local_inputs(
         def _out_name_of(n: str) -> Optional[str]:
             ext = Path(n).suffix.lower()
             if ext in IMAGE_EXTS:
-                return n if ext == image_target_ext else Path(n).with_suffix(image_target_ext).name
+                if ext == image_target_ext:
+                    return n
+                if out_name_mode == "suffix":
+                    return build_suffixed_target_name(n, target_ext=image_target_ext)
+                return Path(n).with_suffix(image_target_ext).name
             if ext in AUDIO_EXTS and audio_target_ext:
-                return n if ext == audio_target_ext else Path(n).with_suffix(audio_target_ext).name
+                if ext == audio_target_ext:
+                    return n
+                if out_name_mode == "suffix":
+                    return build_suffixed_target_name(n, target_ext=audio_target_ext)
+                return Path(n).with_suffix(audio_target_ext).name
             if ext in VIDEO_EXTS or ext in ANIMATED_IMAGE_EXTS:
                 vext = video_target_ext_by_name.get(n)
                 if not vext:
                     return None
-                return n if ext == vext else Path(n).with_suffix(vext).name
+                if ext == vext:
+                    return n
+                if out_name_mode == "suffix":
+                    return build_suffixed_target_name(n, target_ext=vext)
+                return Path(n).with_suffix(vext).name
             if ext in COMIC_EXTS or looks_like_archive_name(n):
-                return n if ext == ".cbz" else Path(n).with_suffix(".cbz").name
+                if ext == ".cbz":
+                    return n
+                if out_name_mode == "suffix":
+                    return build_suffixed_target_name(n, target_ext=".cbz")
+                return Path(n).with_suffix(".cbz").name
             return None
 
         out_overrides = compute_output_name_overrides(file_names, out_name_of=_out_name_of)
@@ -1174,6 +1242,7 @@ def iter_remote_inputs(
     image_codec: str = "webp",
     container: str = "auto",
     audio_policy: str = "copy_if_lossy",
+    out_name_mode: str = "suffix",
 ) -> Tuple[str, Iterator[WorkItem]]:
     root_norm = root_path.rstrip("/") or "/"
     image_target_ext = ".webp" if image_codec == "webp" else ".avif"
@@ -1248,16 +1317,32 @@ def iter_remote_inputs(
             def _out_name_of(n: str) -> Optional[str]:
                 ext = Path(n).suffix.lower()
                 if ext in IMAGE_EXTS:
-                    return n if ext == image_target_ext else Path(n).with_suffix(image_target_ext).name
+                    if ext == image_target_ext:
+                        return n
+                    if out_name_mode == "suffix":
+                        return build_suffixed_target_name(n, target_ext=image_target_ext)
+                    return Path(n).with_suffix(image_target_ext).name
                 if ext in AUDIO_EXTS and audio_target_ext:
-                    return n if ext == audio_target_ext else Path(n).with_suffix(audio_target_ext).name
+                    if ext == audio_target_ext:
+                        return n
+                    if out_name_mode == "suffix":
+                        return build_suffixed_target_name(n, target_ext=audio_target_ext)
+                    return Path(n).with_suffix(audio_target_ext).name
                 if ext in VIDEO_EXTS or ext in ANIMATED_IMAGE_EXTS:
                     vext = video_target_ext_by_name.get(n)
                     if not vext:
                         return None
-                    return n if ext == vext else Path(n).with_suffix(vext).name
+                    if ext == vext:
+                        return n
+                    if out_name_mode == "suffix":
+                        return build_suffixed_target_name(n, target_ext=vext)
+                    return Path(n).with_suffix(vext).name
                 if ext in COMIC_EXTS or looks_like_archive_name(n):
-                    return n if ext == ".cbz" else Path(n).with_suffix(".cbz").name
+                    if ext == ".cbz":
+                        return n
+                    if out_name_mode == "suffix":
+                        return build_suffixed_target_name(n, target_ext=".cbz")
+                    return Path(n).with_suffix(".cbz").name
                 return None
 
             out_overrides = compute_output_name_overrides(names, out_name_of=_out_name_of)
@@ -2607,6 +2692,7 @@ def process_comic_to_cbz(
     archiver: str,
     password: Optional[str],
     image_codec: str,
+    out_name_mode: str,
     webp_quality: int,
     webp_lossless: bool,
     avif_crf: int,
@@ -2644,8 +2730,8 @@ def process_comic_to_cbz(
         img_files_sorted = sorted(img_files, key=lambda p: natural_key(str(p.relative_to(extracted))))
 
         # 同一目录内若存在 1.jpg + 1.png 这类“转码后同名”的情况，避免覆盖：
-        # - 默认：1.jpg/1.png -> 1.webp
-        # - 撞名时：1__jpg.webp / 1__png.webp（必要时加 __2/__3...）
+        # - collision：1.jpg/1.png -> 1.webp；撞名时：1__jpg.webp / 1__png.webp（必要时加 __2/__3...）
+        # - suffix：默认：1.jpg/1.png -> 1__jpg.webp / 1__png.webp；撞名时再追加 __2/__3...
         folder_overrides: Dict[Path, Dict[str, str]] = {}
         folder_names: Dict[Path, List[str]] = {}
         for p in img_files_sorted:
@@ -2657,7 +2743,7 @@ def process_comic_to_cbz(
             rel = p.relative_to(extracted)
             folder_names.setdefault(rel.parent, []).append(rel.name)
         for parent, names in folder_names.items():
-            ov = compute_image_out_name_overrides(names, image_target_ext=target_ext)
+            ov = compute_image_out_name_overrides(names, image_target_ext=target_ext, out_name_mode=out_name_mode)
             if ov:
                 folder_overrides[parent] = ov
 
@@ -2673,7 +2759,10 @@ def process_comic_to_cbz(
                 files_to_zip.append((p, str(rel)))
                 continue
 
-            out_rel = rel.with_suffix(target_ext)
+            if out_name_mode == "suffix":
+                out_rel = rel.with_name(build_suffixed_target_name(rel.name, target_ext=target_ext))
+            else:
+                out_rel = rel.with_suffix(target_ext)
             ov = folder_overrides.get(rel.parent)
             if ov:
                 out_name = ov.get(rel.name)
@@ -2798,6 +2887,7 @@ def process_one_local(
     comic_keep_non_images: bool,
     comic_accept_bigger: bool,
     archive_password: Optional[str],
+    out_name_mode: str,
     rel_override: Optional[str] = None,
     out_rel_override: Optional[str] = None,
     src_size_hint: int = 0,
@@ -2866,6 +2956,7 @@ def process_one_local(
 
         target_ext = ".webp" if image_codec == "webp" else ".avif"
         dst_cbz = (out_root / rel).with_suffix(".cbz")
+        dst_cbz = apply_out_name_mode(dst_cbz, src_rel=rel, target_ext=".cbz", out_name_mode=out_name_mode)
         dst_cbz = apply_out_override(dst_cbz)
 
         # smart-skip
@@ -2897,6 +2988,7 @@ def process_one_local(
             archiver=archiver,
             password=archive_password,
             image_codec=image_codec,
+            out_name_mode=out_name_mode,
             webp_quality=webp_quality,
             webp_lossless=webp_lossless,
             avif_crf=avif_crf,
@@ -2966,6 +3058,7 @@ def process_one_local(
         if container2 == "mp4" and has_subs and not mp4_sub_ok:
             container2 = "mkv"
         out_final = dst_base.with_suffix("." + container2)
+        out_final = apply_out_name_mode(out_final, src_rel=rel, target_ext=out_final.suffix, out_name_mode=out_name_mode)
         out_final = apply_out_override(out_final)
 
         candidates = build_video_candidates(
@@ -3013,6 +3106,7 @@ def process_one_local(
 
     if info.kind == "audio":
         out_final = dst_base.with_suffix(".opus" if audio_policy != "always_copy" else src_local.suffix)
+        out_final = apply_out_name_mode(out_final, src_rel=rel, target_ext=out_final.suffix, out_name_mode=out_name_mode)
         out_final = apply_out_override(out_final)
         cmds = build_audio_candidates(src_arg, out_final, info, audio_policy=audio_policy)
         if not cmds:
@@ -3057,6 +3151,7 @@ def process_one_local(
         v = get_main_video_stream(info)
         src_pf = str(v.get("pix_fmt")) if (v and v.get("pix_fmt")) else None
         out_final = dst_base.with_suffix(image_target_ext)
+        out_final = apply_out_name_mode(out_final, src_rel=rel, target_ext=out_final.suffix, out_name_mode=out_name_mode)
         out_final = apply_out_override(out_final)
 
         candidates = build_image_candidates(
@@ -3154,6 +3249,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="输出（本地路径或 OpenList URL）。缺省：本地输入用同级 <name>__compressed；远端输入用同级 <name>__compressed 目录。",
     )
     ap.add_argument("--inplace", action="store_true", help="原地替换（不推荐远端多设备并发）")
+    ap.add_argument(
+        "--out-name-mode",
+        choices=["suffix", "collision"],
+        default="suffix",
+        help="输出文件命名：suffix=默认追加 __<src_ext>（例如 1.jpg->1__jpg.webp）；collision=仅在撞名时追加（旧逻辑）。",
+    )
 
     ap.add_argument("--container", choices=["mp4", "mkv", "auto"], default="auto")
     ap.add_argument("--faststart", action="store_true", default=True)
@@ -3333,6 +3434,7 @@ def main() -> None:
             image_codec=args.image_codec,
             container=args.container,
             audio_policy=args.audio_policy,
+            out_name_mode=args.out_name_mode,
         )
         in_root_local: Optional[Path] = None
         in_root_display = f"{in_base}{in_root_remote_path}"
@@ -3346,6 +3448,7 @@ def main() -> None:
             image_codec=args.image_codec,
             container=args.container,
             audio_policy=args.audio_policy,
+            out_name_mode=args.out_name_mode,
         )
         in_root_remote_path = None
         in_root_display = str(in_root_local)
@@ -3848,6 +3951,7 @@ def main() -> None:
                     comic_keep_non_images=args.comic_keep_non_images,
                     comic_accept_bigger=args.comic_accept_bigger,
                     archive_password=args.archive_password,
+                    out_name_mode=args.out_name_mode,
                     rel_override=it.rel,
                     out_rel_override=it.out_rel_override,
                     src_size_hint=it.src_size,
