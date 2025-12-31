@@ -1940,7 +1940,8 @@ def ffmpeg_encoders() -> str:
     global _ENCODER_CACHE
     if _ENCODER_CACHE is None:
         cp = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        _ENCODER_CACHE = cp.stdout or ""
+        # 某些 ffmpeg build 可能把列表输出到 stderr；合并避免误判。
+        _ENCODER_CACHE = ((cp.stdout or "") + "\n" + (cp.stderr or "")).strip()
     return _ENCODER_CACHE
 
 
@@ -2116,6 +2117,15 @@ def replace_arg(cmd: List[str], key: str, new_value: str) -> Optional[List[str]]
     out = cmd.copy()
     out[idx + 1] = new_value
     return out
+
+
+def insert_after_pair(cmd: List[str], key: str, value: str, insert: List[str]) -> Optional[List[str]]:
+    for i in range(len(cmd) - 1):
+        if cmd[i] == key and cmd[i + 1] == value:
+            out = cmd.copy()
+            out[i + 2 : i + 2] = insert
+            return out
+    return None
 
 
 def replace_last(cmd: List[str], new_last: str) -> List[str]:
@@ -2298,6 +2308,16 @@ def build_video_candidates(
         cands.append(cmd1)
         if retry:
             cands.append(retry)
+        # NVENC 在部分环境（例如 Debian 的 ffmpeg build + mp4）可能会遇到 muxer 报错：
+        #   [mp4] pts/dts pair unsupported
+        # 这里额外尝试一次禁用 B-frames（避免 pts/dts 不匹配），以提升 NVENC 成功率。
+        if enc == "hevc_nvenc":
+            bf0 = insert_after_pair(cmd1, "-c:v", "hevc_nvenc", ["-bf", "0"])
+            if bf0:
+                cands.append(bf0)
+                bf0_retry = replace_arg(bf0, "-pix_fmt", "yuv420p")
+                if bf0_retry:
+                    cands.append(bf0_retry)
 
     if video_encoder == "auto":
         has_nvenc = has_encoder("hevc_nvenc")
