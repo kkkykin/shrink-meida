@@ -959,6 +959,19 @@ def apply_out_name_mode(p: Path, *, src_rel: str, target_ext: str, out_name_mode
     return p.with_name(build_suffixed_target_name(src_p.name, target_ext=target_ext2))
 
 
+def _unique_collision_name(stem: str, src_ext: str, target_ext: str, reserved: set[str]) -> str:
+    base = f"{stem}__{src_ext}{target_ext}"
+    cand = base
+    if cand in reserved:
+        for i in range(2, 10000):
+            cand2 = f"{stem}__{src_ext}__{i}{target_ext}"
+            if cand2 not in reserved:
+                cand = cand2
+                break
+    reserved.add(cand)
+    return cand
+
+
 def compute_image_out_name_overrides(
     names: Sequence[str],
     *,
@@ -985,16 +998,18 @@ def compute_image_out_name_overrides(
     if len(img_names) <= 1:
         return {}
 
+    def _default_out_name(n: str) -> str:
+        ext = Path(n).suffix.lower()
+        if ext == target_ext:
+            return n
+        if out_name_mode == "suffix":
+            return build_suffixed_target_name(n, target_ext=target_ext)
+        return Path(n).with_suffix(target_ext).name
+
     # default target name (after conversion/copy semantics for images)
     groups: Dict[str, List[str]] = {}
     for n in img_names:
-        ext = Path(n).suffix.lower()
-        if ext == target_ext:
-            out = n
-        elif out_name_mode == "suffix":
-            out = build_suffixed_target_name(n, target_ext=target_ext)
-        else:
-            out = Path(n).with_suffix(target_ext).name
+        out = _default_out_name(n)
         groups.setdefault(out, []).append(n)
 
     need: set[str] = set()
@@ -1014,30 +1029,12 @@ def compute_image_out_name_overrides(
     for n in sorted(img_names):
         if n in need:
             continue
-        ext = Path(n).suffix.lower()
-        if ext == target_ext:
-            out = n
-        elif out_name_mode == "suffix":
-            out = build_suffixed_target_name(n, target_ext=target_ext)
-        else:
-            out = Path(n).with_suffix(target_ext).name
-        reserved.add(out)
+        reserved.add(_default_out_name(n))
 
     overrides: Dict[str, str] = {}
     for n in sorted(need):
         p = Path(n)
-        stem = p.stem
-        src_ext = p.suffix.lower().lstrip(".") or "src"
-        base = f"{stem}__{src_ext}{target_ext}"
-        cand = base
-        if cand in reserved:
-            for i in range(2, 10000):
-                cand2 = f"{stem}__{src_ext}__{i}{target_ext}"
-                if cand2 not in reserved:
-                    cand = cand2
-                    break
-        reserved.add(cand)
-        overrides[n] = cand
+        overrides[n] = _unique_collision_name(p.stem, p.suffix.lower().lstrip(".") or "src", target_ext, reserved)
 
     return overrides
 
@@ -1095,20 +1092,51 @@ def compute_output_name_overrides(
         target_ext = Path(out).suffix.lower() or ""
         if not target_ext.startswith("."):
             target_ext = "." + target_ext if target_ext else ""
-        stem = Path(s).stem
-        src_ext = Path(s).suffix.lower().lstrip(".") or "src"
-        base = f"{stem}__{src_ext}{target_ext}"
-        cand = base
-        if cand in reserved:
-            for i in range(2, 10000):
-                cand2 = f"{stem}__{src_ext}__{i}{target_ext}"
-                if cand2 not in reserved:
-                    cand = cand2
-                    break
-        reserved.add(cand)
-        overrides[s] = cand
+        src_p = Path(s)
+        overrides[s] = _unique_collision_name(src_p.stem, src_p.suffix.lower().lstrip(".") or "src", target_ext, reserved)
 
     return overrides
+
+
+def make_default_out_name_of(
+    *,
+    image_target_ext: str,
+    audio_target_ext: str,
+    video_target_ext_by_name: Dict[str, str],
+    out_name_mode: str,
+) -> Callable[[str], Optional[str]]:
+    def _out_name_of(n: str) -> Optional[str]:
+        ext = Path(n).suffix.lower()
+        if ext in IMAGE_EXTS:
+            if ext == image_target_ext:
+                return n
+            if out_name_mode == "suffix":
+                return build_suffixed_target_name(n, target_ext=image_target_ext)
+            return Path(n).with_suffix(image_target_ext).name
+        if ext in AUDIO_EXTS and audio_target_ext:
+            if ext == audio_target_ext:
+                return n
+            if out_name_mode == "suffix":
+                return build_suffixed_target_name(n, target_ext=audio_target_ext)
+            return Path(n).with_suffix(audio_target_ext).name
+        if ext in VIDEO_EXTS or ext in ANIMATED_IMAGE_EXTS:
+            vext = video_target_ext_by_name.get(n)
+            if not vext:
+                return None
+            if ext == vext:
+                return n
+            if out_name_mode == "suffix":
+                return build_suffixed_target_name(n, target_ext=vext)
+            return Path(n).with_suffix(vext).name
+        if ext in COMIC_EXTS or looks_like_archive_name(n):
+            if ext == ".cbz":
+                return n
+            if out_name_mode == "suffix":
+                return build_suffixed_target_name(n, target_ext=".cbz")
+            return Path(n).with_suffix(".cbz").name
+        return None
+
+    return _out_name_of
 
 
 def iter_local_inputs(
@@ -1189,38 +1217,15 @@ def iter_local_inputs(
                 if has_subs and not mp4_sub_ok:
                     video_target_ext_by_name[n] = ".mkv"
 
-        def _out_name_of(n: str) -> Optional[str]:
-            ext = Path(n).suffix.lower()
-            if ext in IMAGE_EXTS:
-                if ext == image_target_ext:
-                    return n
-                if out_name_mode == "suffix":
-                    return build_suffixed_target_name(n, target_ext=image_target_ext)
-                return Path(n).with_suffix(image_target_ext).name
-            if ext in AUDIO_EXTS and audio_target_ext:
-                if ext == audio_target_ext:
-                    return n
-                if out_name_mode == "suffix":
-                    return build_suffixed_target_name(n, target_ext=audio_target_ext)
-                return Path(n).with_suffix(audio_target_ext).name
-            if ext in VIDEO_EXTS or ext in ANIMATED_IMAGE_EXTS:
-                vext = video_target_ext_by_name.get(n)
-                if not vext:
-                    return None
-                if ext == vext:
-                    return n
-                if out_name_mode == "suffix":
-                    return build_suffixed_target_name(n, target_ext=vext)
-                return Path(n).with_suffix(vext).name
-            if ext in COMIC_EXTS or looks_like_archive_name(n):
-                if ext == ".cbz":
-                    return n
-                if out_name_mode == "suffix":
-                    return build_suffixed_target_name(n, target_ext=".cbz")
-                return Path(n).with_suffix(".cbz").name
-            return None
-
-        out_overrides = compute_output_name_overrides(file_names, out_name_of=_out_name_of)
+        out_overrides = compute_output_name_overrides(
+            file_names,
+            out_name_of=make_default_out_name_of(
+                image_target_ext=image_target_ext,
+                audio_target_ext=audio_target_ext,
+                video_target_ext_by_name=video_target_ext_by_name,
+                out_name_mode=out_name_mode,
+            ),
+        )
         for p in children:
             name = p.name
             if should_ignore_name(name):
@@ -1334,38 +1339,15 @@ def iter_remote_inputs(
                 if ext in VIDEO_EXTS or ext in ANIMATED_IMAGE_EXTS:
                     video_target_ext_by_name[n] = baseline_video_ext
 
-            def _out_name_of(n: str) -> Optional[str]:
-                ext = Path(n).suffix.lower()
-                if ext in IMAGE_EXTS:
-                    if ext == image_target_ext:
-                        return n
-                    if out_name_mode == "suffix":
-                        return build_suffixed_target_name(n, target_ext=image_target_ext)
-                    return Path(n).with_suffix(image_target_ext).name
-                if ext in AUDIO_EXTS and audio_target_ext:
-                    if ext == audio_target_ext:
-                        return n
-                    if out_name_mode == "suffix":
-                        return build_suffixed_target_name(n, target_ext=audio_target_ext)
-                    return Path(n).with_suffix(audio_target_ext).name
-                if ext in VIDEO_EXTS or ext in ANIMATED_IMAGE_EXTS:
-                    vext = video_target_ext_by_name.get(n)
-                    if not vext:
-                        return None
-                    if ext == vext:
-                        return n
-                    if out_name_mode == "suffix":
-                        return build_suffixed_target_name(n, target_ext=vext)
-                    return Path(n).with_suffix(vext).name
-                if ext in COMIC_EXTS or looks_like_archive_name(n):
-                    if ext == ".cbz":
-                        return n
-                    if out_name_mode == "suffix":
-                        return build_suffixed_target_name(n, target_ext=".cbz")
-                    return Path(n).with_suffix(".cbz").name
-                return None
-
-            out_overrides = compute_output_name_overrides(names, out_name_of=_out_name_of)
+            out_overrides = compute_output_name_overrides(
+                names,
+                out_name_of=make_default_out_name_of(
+                    image_target_ext=image_target_ext,
+                    audio_target_ext=audio_target_ext,
+                    video_target_ext_by_name=video_target_ext_by_name,
+                    out_name_mode=out_name_mode,
+                ),
+            )
 
             for name, child_path, size, mtime_ns, sign in sorted(files, key=lambda x: x[0]):
                 rel = posixpath.relpath(child_path, root_norm).replace("\\", "/")
@@ -2944,6 +2926,7 @@ def process_one_local(
 ) -> JobResult:
     rel = rel_override or src_local.relative_to(in_root).as_posix()
     src_arg = str(src_local)
+    dst_base = out_root / rel
 
     def apply_out_override(p: Path) -> Path:
         if not out_rel_override:
@@ -2968,6 +2951,58 @@ def process_one_local(
             return size_of(src_local)
         return src_size_hint
 
+    def _ffmpeg_fail_msg(err: str) -> str:
+        rc = extract_result_from_ffmpeg_err(err)
+        return f"ffmpeg failed ({rc}) -> copied original" if rc else "ffmpeg failed -> copied original"
+
+    def _transcode_or_copy(candidates: List[List[str]], out_final: Path) -> JobResult:
+        ok, err, wrote = run_ffmpeg_with_candidates(candidates, out_final, overwrite=overwrite, dry_run=dry_run)
+        if not ok:
+            if dry_run:
+                return JobResult(True, "dry-run", "ffmpeg failed -> would copy", None, rel)
+            try:
+                if overwrite and out_final.exists():
+                    out_final.unlink()
+            except Exception:
+                pass
+            err2 = ensure_local()
+            if err2:
+                return JobResult(False, "fail", err2)
+            copy_file_local(src_local, dst_base, overwrite=overwrite)
+            return JobResult(True, "copy", _ffmpeg_fail_msg(err), dst_base, rel)
+
+        if dry_run:
+            return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
+        if not wrote:
+            return JobResult(
+                True,
+                "copy",
+                f"output exists -> kept: {out_final}",
+                out_final,
+                out_final.relative_to(out_root).as_posix(),
+            )
+
+        src_sz = src_size_val()
+        out_sz = size_of(out_final)
+        if src_sz > 0 and out_sz > 0 and out_sz >= src_sz * (1.0 - min_savings):
+            try:
+                out_final.unlink()
+            except Exception:
+                pass
+            err3 = ensure_local()
+            if err3:
+                return JobResult(False, "fail", err3)
+            copy_file_local(src_local, dst_base, overwrite=overwrite)
+            return JobResult(
+                True,
+                "copy",
+                f"not enough savings ({fmt_size_change(src_sz, out_sz)}) -> copied original",
+                dst_base,
+                rel,
+            )
+
+        return JobResult(True, "ok", fmt_size_change(src_sz, out_sz), out_final, out_final.relative_to(out_root).as_posix())
+
     probe = None
     info0 = classify(src_local, None)
     if info0.kind in {"video", "audio", "image"}:
@@ -2976,26 +3011,24 @@ def process_one_local(
 
     # subtitle/other -> copy
     if info.kind in {"subtitle", "other"}:
-        dst = out_root / rel
         if dry_run:
             return JobResult(True, "dry-run", f"{info.kind} would copy", None, rel)
         err = ensure_local()
         if err:
             return JobResult(False, "fail", err)
-        copy_file_local(src_local, dst, overwrite=overwrite)
-        return JobResult(True, "copy", f"{info.kind} copied", dst, rel)
+        copy_file_local(src_local, dst_base, overwrite=overwrite)
+        return JobResult(True, "copy", f"{info.kind} copied", dst_base, rel)
 
     # comic/archive
     if info.kind == "comic":
         if not try_archives:
-            dst = out_root / rel
             if dry_run:
                 return JobResult(True, "dry-run", "comic try disabled -> would copy", None, rel)
             err = ensure_local()
             if err:
                 return JobResult(False, "fail", err)
-            copy_file_local(src_local, dst, overwrite=overwrite)
-            return JobResult(True, "copy", "comic copied (try disabled)", dst, rel)
+            copy_file_local(src_local, dst_base, overwrite=overwrite)
+            return JobResult(True, "copy", "comic copied (try disabled)", dst_base, rel)
 
         err = ensure_local()
         if err:
@@ -3028,8 +3061,8 @@ def process_one_local(
             err = ensure_local()
             if err:
                 return JobResult(False, "fail", err)
-            copy_file_local(src_local, out_root / rel, overwrite=overwrite)
-            return JobResult(True, "copy", f"comic smart-skip -> copied original ({reason})", out_root / rel, rel)
+            copy_file_local(src_local, dst_base, overwrite=overwrite)
+            return JobResult(True, "copy", f"comic smart-skip -> copied original ({reason})", dst_base, rel)
 
         ensure_parent(dst_cbz)
         ok, msg = process_comic_to_cbz(
@@ -3055,15 +3088,15 @@ def process_one_local(
                 err = ensure_local()
                 if err:
                     return JobResult(False, "fail", err)
-                copy_file_local(src_local, out_root / rel, overwrite=overwrite)
-                return JobResult(True, "copy", "archive copied (try disabled)", out_root / rel, rel)
+                copy_file_local(src_local, dst_base, overwrite=overwrite)
+                return JobResult(True, "copy", "archive copied (try disabled)", dst_base, rel)
             if dry_run:
                 return JobResult(True, "dry-run", msg, None, rel)
             err = ensure_local()
             if err:
                 return JobResult(False, "fail", err)
-            copy_file_local(src_local, out_root / rel, overwrite=overwrite)
-            return JobResult(True, "copy", msg, out_root / rel, rel)
+            copy_file_local(src_local, dst_base, overwrite=overwrite)
+            return JobResult(True, "copy", msg, dst_base, rel)
 
         if not ok:
             return JobResult(False, "fail", msg)
@@ -3081,24 +3114,21 @@ def process_one_local(
             err = ensure_local()
             if err:
                 return JobResult(False, "fail", err)
-            copy_file_local(src_local, out_root / rel, overwrite=overwrite)
-            return JobResult(True, "copy", f"{msg}; not smaller -> copied original", out_root / rel, rel)
+            copy_file_local(src_local, dst_base, overwrite=overwrite)
+            return JobResult(True, "copy", f"{msg}; not smaller -> copied original", dst_base, rel)
 
         return JobResult(True, "ok", f"{msg}; size {src_sz}->{out_sz}", dst_cbz, dst_cbz.relative_to(out_root).as_posix())
 
     # image already target -> copy
     image_target_ext = ".webp" if image_codec == "webp" else ".avif"
     if info.kind == "image" and src_local.suffix.lower() == image_target_ext:
-        dst = out_root / rel
         if dry_run:
             return JobResult(True, "dry-run", f"already {image_target_ext}", None, rel)
         err = ensure_local()
         if err:
             return JobResult(False, "fail", err)
-        copy_file_local(src_local, dst, overwrite=overwrite)
-        return JobResult(True, "copy", f"already {image_target_ext.lstrip('.')}, copied", dst, rel)
-
-    dst_base = out_root / rel
+        copy_file_local(src_local, dst_base, overwrite=overwrite)
+        return JobResult(True, "copy", f"already {image_target_ext.lstrip('.')}, copied", dst_base, rel)
 
     if info.kind == "video":
         has_subs, mp4_sub_ok = detect_subtitle_compat(info.streams)
@@ -3125,47 +3155,7 @@ def process_one_local(
             pix_fmt=pix_fmt,
             faststart=faststart,
         )
-        ok, err, wrote = run_ffmpeg_with_candidates(candidates, out_final, overwrite=overwrite, dry_run=dry_run)
-        if not ok:
-            if dry_run:
-                return JobResult(True, "dry-run", "ffmpeg failed -> would copy", None, rel)
-            try:
-                if overwrite and out_final.exists():
-                    out_final.unlink()
-            except Exception:
-                pass
-            err2 = ensure_local()
-            if err2:
-                return JobResult(False, "fail", err2)
-            copy_file_local(src_local, dst_base, overwrite=overwrite)
-            rc = extract_result_from_ffmpeg_err(err)
-            msg = f"ffmpeg failed ({rc}) -> copied original" if rc else "ffmpeg failed -> copied original"
-            return JobResult(True, "copy", msg, dst_base, rel)
-        if dry_run:
-            return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
-        if not wrote:
-            return JobResult(True, "copy", f"output exists -> kept: {out_final}", out_final, out_final.relative_to(out_root).as_posix())
-
-        src_sz = src_size_val()
-        out_sz = size_of(out_final)
-        if src_sz > 0 and out_sz > 0 and out_sz >= src_sz * (1.0 - min_savings):
-            try:
-                out_final.unlink()
-            except Exception:
-                pass
-            err = ensure_local()
-            if err:
-                return JobResult(False, "fail", err)
-            copy_file_local(src_local, dst_base, overwrite=overwrite)
-            return JobResult(
-                True,
-                "copy",
-                f"not enough savings ({fmt_size_change(src_sz, out_sz)}) -> copied original",
-                dst_base,
-                rel,
-            )
-
-        return JobResult(True, "ok", fmt_size_change(src_sz, out_sz), out_final, out_final.relative_to(out_root).as_posix())
+        return _transcode_or_copy(candidates, out_final)
 
     if info.kind == "audio":
         out_final = dst_base.with_suffix(".opus" if audio_policy != "always_copy" else src_local.suffix)
@@ -3181,47 +3171,7 @@ def process_one_local(
             copy_file_local(src_local, dst_base, overwrite=overwrite)
             return JobResult(True, "copy", "no audio stream -> copied", dst_base, rel)
 
-        ok, err, wrote = run_ffmpeg_with_candidates(cmds, out_final, overwrite=overwrite, dry_run=dry_run)
-        if not ok:
-            if dry_run:
-                return JobResult(True, "dry-run", "ffmpeg failed -> would copy", None, rel)
-            try:
-                if overwrite and out_final.exists():
-                    out_final.unlink()
-            except Exception:
-                pass
-            err2 = ensure_local()
-            if err2:
-                return JobResult(False, "fail", err2)
-            copy_file_local(src_local, dst_base, overwrite=overwrite)
-            rc = extract_result_from_ffmpeg_err(err)
-            msg = f"ffmpeg failed ({rc}) -> copied original" if rc else "ffmpeg failed -> copied original"
-            return JobResult(True, "copy", msg, dst_base, rel)
-        if dry_run:
-            return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
-        if not wrote:
-            return JobResult(True, "copy", f"output exists -> kept: {out_final}", out_final, out_final.relative_to(out_root).as_posix())
-
-        src_sz = src_size_val()
-        out_sz = size_of(out_final)
-        if src_sz > 0 and out_sz > 0 and out_sz >= src_sz * (1.0 - min_savings):
-            try:
-                out_final.unlink()
-            except Exception:
-                pass
-            err = ensure_local()
-            if err:
-                return JobResult(False, "fail", err)
-            copy_file_local(src_local, dst_base, overwrite=overwrite)
-            return JobResult(
-                True,
-                "copy",
-                f"not enough savings ({fmt_size_change(src_sz, out_sz)}) -> copied original",
-                dst_base,
-                rel,
-            )
-
-        return JobResult(True, "ok", fmt_size_change(src_sz, out_sz), out_final, out_final.relative_to(out_root).as_posix())
+        return _transcode_or_copy(cmds, out_final)
 
     if info.kind == "image":
         v = get_main_video_stream(info)
@@ -3240,56 +3190,15 @@ def process_one_local(
             avif_pix_fmt=avif_pix_fmt,
             src_pix_fmt=src_pf,
         )
-        ok, err, wrote = run_ffmpeg_with_candidates(candidates, out_final, overwrite=overwrite, dry_run=dry_run)
-        if not ok:
-            if dry_run:
-                return JobResult(True, "dry-run", "ffmpeg failed -> would copy", None, rel)
-            try:
-                if overwrite and out_final.exists():
-                    out_final.unlink()
-            except Exception:
-                pass
-            err2 = ensure_local()
-            if err2:
-                return JobResult(False, "fail", err2)
-            copy_file_local(src_local, dst_base, overwrite=overwrite)
-            rc = extract_result_from_ffmpeg_err(err)
-            msg = f"ffmpeg failed ({rc}) -> copied original" if rc else "ffmpeg failed -> copied original"
-            return JobResult(True, "copy", msg, dst_base, rel)
-        if dry_run:
-            return JobResult(True, "dry-run", "ok", None, out_final.relative_to(out_root).as_posix())
-        if not wrote:
-            return JobResult(True, "copy", f"output exists -> kept: {out_final}", out_final, out_final.relative_to(out_root).as_posix())
+        return _transcode_or_copy(candidates, out_final)
 
-        src_sz = src_size_val()
-        out_sz = size_of(out_final)
-        if src_sz > 0 and out_sz > 0 and out_sz >= src_sz * (1.0 - min_savings):
-            try:
-                out_final.unlink()
-            except Exception:
-                pass
-            err = ensure_local()
-            if err:
-                return JobResult(False, "fail", err)
-            copy_file_local(src_local, dst_base, overwrite=overwrite)
-            return JobResult(
-                True,
-                "copy",
-                f"not enough savings ({fmt_size_change(src_sz, out_sz)}) -> copied original",
-                dst_base,
-                rel,
-            )
-
-        return JobResult(True, "ok", fmt_size_change(src_sz, out_sz), out_final, out_final.relative_to(out_root).as_posix())
-
-    dst = out_root / rel
     if dry_run:
         return JobResult(True, "dry-run", "fallback copy", None, rel)
     err = ensure_local()
     if err:
         return JobResult(False, "fail", err)
-    copy_file_local(src_local, dst, overwrite=overwrite)
-    return JobResult(True, "copy", "fallback copied", dst, rel)
+    copy_file_local(src_local, dst_base, overwrite=overwrite)
+    return JobResult(True, "copy", "fallback copied", dst_base, rel)
 
 
 # ------------------------

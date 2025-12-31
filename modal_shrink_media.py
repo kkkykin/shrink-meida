@@ -79,6 +79,8 @@ SHRINK_MEDIA_ARGV: list[str] = [
     "3",
     "--upload-jobs",
     "2",
+    "--out-name-mode",
+    "collision",
 ]
 
 
