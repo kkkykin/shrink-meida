@@ -1,0 +1,17 @@
+[project]
+name = "shrink-media"
+version = "0.1.0"
+description = "多媒体瘦身工具，支持本地 / OpenList 远端输入输出 + 多设备协同"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "openlist",
+    "tenacity>=8.2",
+    "rich>=13.7",
+]
+
+[project.scripts]
+shrink-media = "shrink_media.cli:main"
+
+[[tool.uv.index]]
+url = "https://mirrors.ustc.edu.cn/pypi/simple/"
