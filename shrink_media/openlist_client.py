@@ -31,6 +31,7 @@ __all__ = [
     "HttpStatusError",
     "parse_remote_location",
     "remote_join",
+    "mtime_to_ns",
     "RemoteEntry",
     "OpenListClientSync",
 ]
@@ -119,11 +120,15 @@ def remote_join(root: str, rel: str) -> str:
     return f"{root_clean}/{rel_clean}" if rel_clean else (root_clean + "/")
 
 
-def _mtime_to_ns(dt: Any) -> int:
+def mtime_to_ns(dt: Any) -> int:
     try:
         return int(dt.timestamp() * 1_000_000_000)
     except Exception:
         return 0
+
+
+def _mtime_to_ns(dt: Any) -> int:
+    return mtime_to_ns(dt)
 
 
 @dataclass
@@ -213,6 +218,9 @@ class OpenListClientSync:
         if code is None:
             return False
         return code >= 500 or code in {408, 425, 429}
+
+    def is_retryable(self, e: Exception) -> bool:
+        return self._is_retryable(e)
 
     def _login_or_die(self, *, reason: str) -> None:
         assert self._client is not None

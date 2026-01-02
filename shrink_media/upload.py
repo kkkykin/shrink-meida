@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from .logging import _LOGGER, _DEBUG_ENABLED, log_err
-from .openlist_client import OpenListClientSync, FatalAuthError, _mtime_to_ns, remote_join
+from .openlist_client import OpenListClientSync, FatalAuthError, mtime_to_ns, remote_join
 from .utils import fmt_bytes
 
 __all__ = [
@@ -106,7 +106,7 @@ def _openlist_find_autorename_candidate(
             sz = int(getattr(obj, "size", 0) or 0)
             if sz != expected_size:
                 continue
-            mtime_ns = _mtime_to_ns(getattr(obj, "modified", None))
+            mtime_ns = mtime_to_ns(getattr(obj, "modified", None))
             cand = (mtime_ns, idx, name)
             if best is None or cand > best:
                 best = cand

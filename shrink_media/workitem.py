@@ -15,7 +15,7 @@ from .constants import (
     STATE_DIR_NAME,
 )
 from .utils import should_ignore_name, looks_like_archive_name
-from .openlist_client import OpenListClientSync, FatalAuthError, _mtime_to_ns
+from .openlist_client import OpenListClientSync, FatalAuthError, mtime_to_ns
 from .probe import ffprobe_json
 from .classify import classify, detect_subtitle_compat
 
@@ -406,7 +406,7 @@ def iter_remote_inputs(
                 is_remote=True,
                 remote_path=root_norm,
                 src_size=int(getattr(root_info, "size", 0) or 0),
-                src_mtime_ns=_mtime_to_ns(getattr(root_info, "modified", None)),
+                src_mtime_ns=mtime_to_ns(getattr(root_info, "modified", None)),
             )
             return
 
@@ -437,7 +437,7 @@ def iter_remote_inputs(
                             name,
                             child_path,
                             int(getattr(obj, "size", 0) or 0),
-                            _mtime_to_ns(getattr(obj, "modified", None)),
+                            mtime_to_ns(getattr(obj, "modified", None)),
                             str(getattr(obj, "sign", "") or ""),
                         )
                     )

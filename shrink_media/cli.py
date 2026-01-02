@@ -7,7 +7,6 @@ import concurrent.futures as cf
 import itertools
 import json
 import os
-import platform
 import posixpath
 import queue
 import shlex
@@ -21,12 +20,14 @@ from typing import Any, Dict, Iterator, List, Optional
 from .logging import configure_logging, log, log_err
 from .constants import STATE_DEFAULT_NAME, STATE_DIR_NAME, LOCKS_DIR_NAME
 from .utils import is_url
-from .openlist_client import OpenListClientSync, FatalAuthError, parse_remote_location, remote_join
-from .workitem import WorkItem, iter_local_inputs, iter_remote_inputs
+from .openlist_client import OpenListClientSync, FatalAuthError, remote_join
+from .workitem import WorkItem
 from .state import StateBackendJsonl, StateBackendPerFile, LockBackend, Coordinator
 from .probe import require_tools
 from .processor import JobResult
 from .pipeline import PipelineContext, StageResult, UploadFutureInfo
+from .remote import get_device_id, init_remote_client, validate_same_server
+from .planning import plan_input, plan_output
 
 __all__ = ["main"]
 
@@ -487,73 +488,14 @@ def main() -> None:
         log_err("ERROR: --inplace 与 --output 不能同时使用。")
         sys.exit(2)
 
-    # Windows 无 os.uname；platform.node/COMPUTERNAME 作为回退
-    if args.device_id:
-        device_id = args.device_id
-    else:
-        try:
-            device_id = os.uname().nodename  # type: ignore[attr-defined]
-        except AttributeError:
-            device_id = platform.node() or os.environ.get("COMPUTERNAME") or "unknown"
-
-    remote_client: Optional[OpenListClientSync] = None
-    remote_base: Optional[str] = None
-    if is_url(args.input) or (args.output and is_url(args.output)):
-        base_candidate = args.input if is_url(args.input) else args.output
-        remote_base, _ = parse_remote_location(base_candidate)
-        if not args.openlist_user or not args.openlist_pass:
-            log_err("ERROR: 远端操作需要 --openlist-user 与 --openlist-pass。")
-            sys.exit(2)
-        remote_client = OpenListClientSync(
-            remote_base,
-            args.openlist_user,
-            args.openlist_pass,
-            timeout=args.openlist_timeout,
-            otp_key=args.openlist_otp,
-            retries=args.retries,
-            retry_backoff=args.retry_backoff,
-        )
-    # 同一服务器检查（目前仅支持单服务器）
-    if is_url(args.input) and args.output and is_url(args.output):
-        base_in, _ = parse_remote_location(args.input)
-        base_out, _ = parse_remote_location(args.output)
-        if base_in != base_out:
-            log_err("ERROR: 当前版本仅支持同一 OpenList 服务器的输入/输出。")
-            sys.exit(2)
+    device_id = get_device_id(args)
+    remote_client, remote_base = init_remote_client(args)
+    validate_same_server(args)
 
     # 输入枚举
-    input_is_remote = is_url(args.input)
-    if input_is_remote:
-        if remote_client is None:
-            log_err("ERROR: OpenList 输入需要远端客户端。")
-            sys.exit(2)
-        in_base, in_root_remote_path = parse_remote_location(args.input)
-        in_root_remote_path, items_iter = iter_remote_inputs(
-            remote_client,
-            in_root_remote_path,
-            image_codec=args.image_codec,
-            container=args.container,
-            audio_policy=args.audio_policy,
-            out_name_mode=args.out_name_mode,
-        )
-        in_root_local: Optional[Path] = None
-        in_root_display = f"{in_base}{in_root_remote_path}"
-    else:
-        in_path = Path(args.input).expanduser().resolve()
-        if not in_path.exists():
-            log_err("ERROR: 输入路径不存在。")
-            sys.exit(2)
-        in_root_local, items_iter = iter_local_inputs(
-            in_path,
-            image_codec=args.image_codec,
-            container=args.container,
-            audio_policy=args.audio_policy,
-            out_name_mode=args.out_name_mode,
-        )
-        in_root_remote_path = None
-        in_root_display = str(in_root_local)
+    input_plan = plan_input(args, remote_client)
 
-    items_iter = iter(items_iter)
+    items_iter = iter(input_plan.items_iter)
     try:
         first_item = next(items_iter)
     except StopIteration:
@@ -562,84 +504,29 @@ def main() -> None:
     items_iter = itertools.chain([first_item], items_iter)
 
     # 输出位置
-    out_is_remote = False
-    out_root_local: Optional[Path] = None
-    out_root_remote_path: Optional[str] = None
-    out_root_display: Optional[str] = None
-
-    if args.inplace:
-        if input_is_remote:
-            out_is_remote = True
-            out_root_remote_path = in_root_remote_path
-            out_root_display = f"{remote_base or ''}{out_root_remote_path or ''}"
-        else:
-            out_is_remote = False
-            out_root_local = in_root_local
-            out_root_display = str(out_root_local)
-    else:
-        if args.output is None:
-            if input_is_remote:
-                assert in_root_remote_path is not None
-                path = in_root_remote_path.rstrip("/")
-                parent, name = posixpath.split(path)
-                if name == "":
-                    name = "__compressed"
-                else:
-                    name = name + "__compressed"
-                new_path = f"{parent}/{name}" if parent else f"/{name}"
-                out_root_remote_path = new_path
-                out_is_remote = True
-                out_root_display = f"{remote_base or ''}{out_root_remote_path}"
-            else:
-                assert in_root_local is not None
-                out_root_local = in_root_local.parent / (in_root_local.name + "__compressed")
-                out_root_local.mkdir(parents=True, exist_ok=True)
-                out_is_remote = False
-                out_root_display = str(out_root_local)
-        else:
-            if is_url(args.output):
-                out_is_remote = True
-                base_out, path_out = parse_remote_location(args.output)
-                if remote_client is None:
-                    remote_base = base_out
-                    remote_client = OpenListClientSync(
-                        base_out,
-                        args.openlist_user,
-                        args.openlist_pass,
-                        timeout=args.openlist_timeout,
-                        otp_key=args.openlist_otp,
-                        retries=args.retries,
-                        retry_backoff=args.retry_backoff,
-                    )
-                out_root_remote_path = path_out if path_out.endswith("/") else path_out + "/"
-                out_root_display = f"{base_out}{out_root_remote_path}"
-            else:
-                out_is_remote = False
-                out_root_local = Path(args.output).expanduser().resolve()
-                out_root_local.mkdir(parents=True, exist_ok=True)
-                out_root_display = str(out_root_local)
+    output_plan, remote_client, remote_base = plan_output(args, input_plan, remote_client, remote_base)
 
     # state + locks
-    if out_is_remote:
-        assert remote_client is not None and out_root_remote_path is not None
+    if output_plan.is_remote:
+        assert remote_client is not None and output_plan.root_remote_path is not None
         state_backend = StateBackendPerFile(
-            remote_dir_path=remote_join(out_root_remote_path, STATE_DIR_NAME),
+            remote_dir_path=remote_join(output_plan.root_remote_path, STATE_DIR_NAME),
             client=remote_client,
-            legacy_jsonl_path=remote_join(out_root_remote_path, STATE_DEFAULT_NAME),
+            legacy_jsonl_path=remote_join(output_plan.root_remote_path, STATE_DEFAULT_NAME),
         )
         lock_backend = LockBackend(
             local_dir=None,
-            remote_dir_path=remote_join(out_root_remote_path, LOCKS_DIR_NAME),
+            remote_dir_path=remote_join(output_plan.root_remote_path, LOCKS_DIR_NAME),
             client=remote_client,
             device_id=device_id,
             ttl_sec=args.lock_ttl,
             steal_stale=args.steal_stale_lock,
         )
     else:
-        assert out_root_local is not None
-        state_backend = StateBackendJsonl(local_path=out_root_local / STATE_DEFAULT_NAME, remote_path=None, client=None)
+        assert output_plan.root_local is not None
+        state_backend = StateBackendJsonl(local_path=output_plan.root_local / STATE_DEFAULT_NAME, remote_path=None, client=None)
         lock_backend = LockBackend(
-            local_dir=out_root_local / LOCKS_DIR_NAME,
+            local_dir=output_plan.root_local / LOCKS_DIR_NAME,
             remote_dir_path=None,
             client=None,
             device_id=device_id,
@@ -655,14 +542,14 @@ def main() -> None:
         device_id=device_id,
         coord=coord,
         remote_client=remote_client,
-        input_is_remote=input_is_remote,
-        out_is_remote=out_is_remote,
-        in_root_local=in_root_local,
-        in_root_remote_path=in_root_remote_path,
-        out_root_local=out_root_local,
-        out_root_remote_path=out_root_remote_path,
-        in_root_display=in_root_display,
-        out_root_display=out_root_display or "",
+        input_is_remote=input_plan.is_remote,
+        out_is_remote=output_plan.is_remote,
+        in_root_local=input_plan.root_local,
+        in_root_remote_path=input_plan.root_remote_path,
+        out_root_local=output_plan.root_local,
+        out_root_remote_path=output_plan.root_remote_path,
+        in_root_display=input_plan.display,
+        out_root_display=output_plan.display or "",
     )
 
     try:

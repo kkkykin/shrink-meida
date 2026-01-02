@@ -43,6 +43,8 @@ def has_encoder(enc: str) -> bool:
 
 
 def ffprobe_json(path: str | Path, *, dry_run: bool) -> Optional[Dict[str, Any]]:
+    if dry_run:
+        return None
     cp = subprocess.run(
         [
             "ffprobe",

@@ -392,9 +392,10 @@ class LockBackend:
             stale = True
 
         try:
+            lock_token = f"{now}:{self.device_id}"
             self.client.upload_text(
                 lock_file,
-                json.dumps({"ts": now, "device_id": self.device_id}, ensure_ascii=False),
+                json.dumps({"ts": now, "device_id": self.device_id, "token": lock_token}, ensure_ascii=False),
                 overwrite=True,
             )
             # OpenList 服务端偶尔不会立即刷新"新创建/更新 lock 文件"的状态；触发一次 listdir(refresh=True) 提示它更新。
@@ -404,6 +405,17 @@ class LockBackend:
                 raise
             except Exception:
                 pass
+            # read-back verification: 确保写入的是我们自己的锁，避免并发覆盖
+            try:
+                txt2 = self.client.read_text(lock_file)
+                obj2 = json.loads(txt2 or "{}")
+                token2 = str(obj2.get("token", ""))
+                if token2 != lock_token:
+                    return False, f"lock verify failed: token mismatch (expected={lock_token}, got={token2})"
+            except FatalAuthError:
+                raise
+            except Exception as e:
+                return False, f"lock verify failed: {e}"
             return True, "stolen" if (stale and owner) else "ok"
         except FatalAuthError:
             raise

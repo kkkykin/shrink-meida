@@ -63,6 +63,18 @@ class PipelineContext:
     - 持有 prefetch / upload 相关的 executor、队列、状态
     - 持有统计计数器
     - 提供 dbg/pdebug/set_fatal/raise_if_fatal 等工具方法
+
+    线程安全约束：
+    - 以下字段仅由主线程(调度线程)访问，不加锁：
+      - ok, skipped, failed, failed_items, interrupted
+    - 以下字段由多线程访问，需加锁：
+      - _fatal_error: 通过 _fatal_mu 保护
+      - scan_total/done/proc/enqueued: 通过 _scan_mu 保护
+      - prefetch_futs/results/claimed: 通过 _prefetch_mu 保护
+      - prefetch_candidates: 通过 _prefetch_candidates_mu 保护
+      - upload_futs, deferred_uploads: 通过 _upload_mu 保护
+    - stop_event: threading.Event，本身线程安全
+    - work_q: queue.Queue，本身线程安全
     """
 
     def __init__(
@@ -117,7 +129,8 @@ class PipelineContext:
         # 工作队列
         self.work_q: queue.Queue[Optional[WorkItem]] = queue.Queue(maxsize=max(1, args.jobs) * 4)
 
-        # 上传相关
+        # 上传相关 (受 _upload_mu 保护)
+        self._upload_mu = threading.Lock()
         self.upload_dir: Optional[Path] = None
         self.upload_executor: Optional[cf.ThreadPoolExecutor] = None
         self.upload_slots: Optional[threading.BoundedSemaphore] = None
@@ -207,7 +220,7 @@ class PipelineContext:
 
     def is_retryable_upload_error(self, e: Exception) -> bool:
         try:
-            if self.remote_client is not None and self.remote_client._is_retryable(e):
+            if self.remote_client is not None and self.remote_client.is_retryable(e):
                 return True
         except Exception:
             pass
@@ -219,7 +232,8 @@ class PipelineContext:
     def upload_queue_idleish_for_retry(self) -> bool:
         if self.upload_executor is None or self.args.upload_jobs <= 0:
             return False
-        return len(self.upload_futs) < (self.args.upload_jobs / 2)
+        with self._upload_mu:
+            return len(self.upload_futs) < (self.args.upload_jobs / 2)
 
     # ---- 预取相关 ----
     def offer_prefetch(self, it: WorkItem) -> None:
