@@ -611,7 +611,7 @@ def main() -> None:
                         retries=args.retries,
                         retry_backoff=args.retry_backoff,
                     )
-                out_root_remote_path = path_out if path_out.endswith("/") else path_out
+                out_root_remote_path = path_out if path_out.endswith("/") else path_out + "/"
                 out_root_display = f"{base_out}{out_root_remote_path}"
             else:
                 out_is_remote = False

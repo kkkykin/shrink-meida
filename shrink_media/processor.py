@@ -76,8 +76,12 @@ def process_one_local(
         if not out_rel_override:
             return p
         try:
+            from pathlib import PurePosixPath
+            ov_posix = PurePosixPath(out_rel_override)
+            if ov_posix.is_absolute() or ".." in ov_posix.parts:
+                return p
             ov = Path(out_rel_override)
-            if ov.is_absolute() or (".." in ov.parts):
+            if ov.is_absolute() or ov.drive or ov.anchor or ".." in ov.parts:
                 return p
             if ov.suffix.lower() != p.suffix.lower():
                 return p

@@ -135,8 +135,9 @@ class StateBackendPerFile:
         with self._mu:
             if path in self._ensured_dirs:
                 return
-            self._ensured_dirs.add(path)
         self.client.ensure_dir(path)
+        with self._mu:
+            self._ensured_dirs.add(path)
 
     def _path_for_rel(self, rel: str) -> Tuple[str, str]:
         token = sha1_hex(rel)
