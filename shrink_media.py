@@ -37,6 +37,7 @@ import os
 import platform
 import posixpath
 import queue
+import random
 import re
 import shlex
 import shutil
@@ -3575,6 +3576,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=0,
         help="异步上传远端输出的并发数（仅远端输出；0 表示在 worker 内同步上传）",
     )
+    ap.add_argument(
+        "--upload-idle-retries",
+        type=int,
+        default=5,
+        help="异步上传失败后，在队列较空闲时额外重试次数（仅远端输出 + upload-jobs>0；0 表示关闭）",
+    )
 
     # multi-device
     ap.add_argument("--device-id", type=str, default=None)
@@ -3614,6 +3621,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ap.error("--retries must be >= 0")
     if args.retry_backoff < 0:
         ap.error("--retry-backoff must be >= 0")
+    if args.upload_idle_retries < 0:
+        ap.error("--upload-idle-retries must be >= 0")
 
     if args.device_id is None:
         args.device_id = _env_nonempty("SHRINK_MEDIA_DEVICE_ID") or _env_nonempty("DEVICE_ID")
@@ -3839,6 +3848,14 @@ def main() -> None:
         # bounded backlog：最多允许 2x 并发数的上传任务“在途”（含排队与执行），避免输出在本地无限堆积
         upload_slots = threading.BoundedSemaphore(max(1, args.upload_jobs) * 2)
 
+    # 上传失败后的“队列空闲时重试”：
+    # - 仅用于异步上传（upload_executor != None），避免同步上传路径引入额外的本地堆积
+    # - 不跨进程持久化：仍按现有 processing/done/fail + lock TTL 逻辑运行
+    upload_idle_retries = max(0, int(getattr(args, "upload_idle_retries", 0) or 0))
+    upload_idle_retry_base_sec = max(30.0, float(args.retry_backoff) * 10.0)
+    upload_idle_retry_cap_sec = 10.0 * 60.0
+    deferred_uploads: Dict[str, DeferredUpload] = {}
+
     # 远端预取
     prefetch_dir: Optional[Path] = None
     prefetch_futs: Dict[str, cf.Future[Tuple[bool, Optional[Path], str]]] = {}
@@ -4020,7 +4037,13 @@ def main() -> None:
     if input_is_remote:
         log(f"Remote prefetch: {'ON' if prefetch_executor is not None else 'OFF'} | prefetch: {args.prefetch}")
     if out_is_remote:
-        log(f"Remote upload async: {'ON' if upload_executor is not None else 'OFF'} | upload jobs: {args.upload_jobs}")
+        if upload_executor is not None:
+            log(
+                f"Remote upload async: ON | upload jobs: {args.upload_jobs} | idle retries: {upload_idle_retries}"
+                f" (when upload_futs < {args.upload_jobs}/2)"
+            )
+        else:
+            log(f"Remote upload async: OFF | upload jobs: {args.upload_jobs}")
 
     interrupted = False
 
@@ -4047,6 +4070,22 @@ def main() -> None:
         jr: JobResult
         upload_dst_path: Optional[str] = None
 
+    @dataclass
+    class UploadFutureInfo:
+        it: WorkItem
+        jr: JobResult
+        dst_path: str
+        idle_retry_attempt: int  # 0=首次上传；1..N=空闲重试次数
+
+    @dataclass
+    class DeferredUpload:
+        it: WorkItem
+        jr: JobResult
+        dst_path: str
+        idle_retry_attempt: int  # 下一次尝试的编号（1..N）
+        next_retry_at: float
+        last_err: str = ""
+
     def safe_append(status: str, it: WorkItem, *, dst_rel: Optional[str] = None) -> None:
         try:
             coord.append(status, it, dst_rel=dst_rel)
@@ -4056,8 +4095,35 @@ def main() -> None:
         except Exception as e:
             log_err(f"[WARN] state append failed ({status}) for {it.rel}: {e}")
 
-    def upload_worker(it: WorkItem, jr: JobResult, dst_path: str) -> Tuple[WorkItem, JobResult]:
+    def _upload_idle_retry_delay_sec(attempt: int) -> float:
+        """
+        空闲重试退避（避免频繁打满带宽/触发限流）：
+        - base: max(30s, retry_backoff*10)
+        - exponential backoff with jitter
+        - cap: 10min
+        """
+        attempt = max(1, int(attempt) or 1)
+        delay = upload_idle_retry_base_sec * (2 ** max(0, attempt - 1))
+        delay = min(delay, upload_idle_retry_cap_sec)
+        jitter = 0.8 + random.random() * 0.4
+        return max(0.0, delay * jitter)
+
+    def _is_retryable_upload_error(e: Exception) -> bool:
+        # 复用 OpenListClientSync 的 retryable 判断（httpx 网络异常 + 408/425/429/5xx）
+        try:
+            if remote_client is not None and remote_client._is_retryable(e):
+                return True
+        except Exception:
+            pass
+        # upload_file_remote 的 verify mismatch 有时是目录缓存/延迟：允许在空闲时再试几次
+        msg = str(e).lower()
+        if "upload verify failed" in msg:
+            return True
+        return False
+
+    def upload_worker(it: WorkItem, jr: JobResult, dst_path: str, idle_retry_attempt: int) -> Tuple[WorkItem, JobResult]:
         assert remote_client is not None
+        defer_retry = False
         try:
             if jr.out_local is None or jr.out_rel is None:
                 return it, JobResult(True, "skip", "no output generated")
@@ -4070,21 +4136,32 @@ def main() -> None:
         except FatalAuthError:
             raise
         except Exception as e:
+            retryable = _is_retryable_upload_error(e)
+            if (
+                retryable
+                and not stop_event.is_set()
+                and upload_executor is not None
+                and upload_idle_retries > 0
+                and idle_retry_attempt < upload_idle_retries
+            ):
+                defer_retry = True
+                return it, JobResult(False, "defer", f"upload failed (defer): {e}", None, jr.out_rel)
             return it, JobResult(False, "fail", f"upload failed: {e}", None, jr.out_rel)
         finally:
-            if jr.out_local is not None:
-                try:
-                    jr.out_local.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if not args.dry_run and not stop_event.is_set():
-                dbg(f"lock release (upload) {it.rel}")
-                coord.locks.release(it.rel)
-            if upload_slots is not None:
-                try:
-                    upload_slots.release()
-                except ValueError:
-                    pass
+            if not defer_retry:
+                if jr.out_local is not None:
+                    try:
+                        jr.out_local.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                if not args.dry_run and not stop_event.is_set():
+                    dbg(f"lock release (upload) {it.rel}")
+                    coord.locks.release(it.rel)
+                if upload_slots is not None:
+                    try:
+                        upload_slots.release()
+                    except ValueError:
+                        pass
 
     def worker(it: WorkItem) -> StageResult:
         dbg(f"start {it.rel} remote={it.is_remote} size={it.src_size}")
@@ -4288,7 +4365,117 @@ def main() -> None:
         if not args.dry_run:
             safe_append("fail", it, dst_rel=jr.out_rel)
 
-    upload_futs: Dict[cf.Future[Tuple[WorkItem, JobResult]], WorkItem] = {}
+    upload_futs: Dict[cf.Future[Tuple[WorkItem, JobResult]], UploadFutureInfo] = {}
+
+    def _upload_queue_idleish_for_retry() -> bool:
+        # 仅在异步上传启用时生效；用户期望：upload_futs < upload_jobs/2 时认为“队列较空闲”
+        if upload_executor is None or args.upload_jobs <= 0:
+            return False
+        return len(upload_futs) < (args.upload_jobs / 2)
+
+    def _finalize_deferred_as_fail(meta: UploadFutureInfo, *, msg: str) -> None:
+        # defer 场景下 upload_worker 不会释放 lock/slot，这里负责兜底清理
+        finalize(meta.it, JobResult(False, "fail", msg, None, meta.jr.out_rel))
+        if meta.jr.out_local is not None:
+            try:
+                meta.jr.out_local.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if not args.dry_run and not stop_event.is_set():
+            try:
+                coord.locks.release(meta.it.rel)
+            except FatalAuthError:
+                raise
+            except Exception:
+                pass
+        if upload_slots is not None:
+            try:
+                upload_slots.release()
+            except ValueError:
+                pass
+
+    def _defer_upload(meta: UploadFutureInfo, *, err_msg: str) -> None:
+        if meta.jr.out_local is None or not meta.jr.out_local.exists():
+            _finalize_deferred_as_fail(meta, msg="upload deferred but local output missing")
+            return
+        next_attempt = int(meta.idle_retry_attempt) + 1
+        delay = _upload_idle_retry_delay_sec(next_attempt)
+        deferred_uploads[meta.it.rel] = DeferredUpload(
+            it=meta.it,
+            jr=meta.jr,
+            dst_path=meta.dst_path,
+            idle_retry_attempt=next_attempt,
+            next_retry_at=time.time() + delay,
+            last_err=err_msg,
+        )
+        log_err(
+            f"[WARN] upload defer {meta.it.rel} | retry {next_attempt}/{upload_idle_retries} in {delay:.1f}s | {err_msg}"
+        )
+
+    def pump_deferred_uploads() -> None:
+        if stop_event.is_set():
+            return
+        if upload_executor is None:
+            return
+        if upload_idle_retries <= 0:
+            return
+        if not deferred_uploads:
+            return
+        if not _upload_queue_idleish_for_retry():
+            return
+        now = time.time()
+        due = [du for du in deferred_uploads.values() if du.next_retry_at <= now]
+        if not due:
+            return
+        due.sort(key=lambda x: (x.next_retry_at, x.idle_retry_attempt, x.it.rel))
+        for du in due:
+            if stop_event.is_set():
+                break
+            if not _upload_queue_idleish_for_retry():
+                break
+            if du.jr.out_local is None or not du.jr.out_local.exists():
+                meta0 = UploadFutureInfo(
+                    it=du.it,
+                    jr=du.jr,
+                    dst_path=du.dst_path,
+                    idle_retry_attempt=max(0, du.idle_retry_attempt - 1),
+                )
+                _finalize_deferred_as_fail(meta0, msg="upload deferred but local output missing")
+                deferred_uploads.pop(du.it.rel, None)
+                continue
+            deferred_uploads.pop(du.it.rel, None)
+            dbg(f"upload retry#{du.idle_retry_attempt}/{upload_idle_retries} {du.it.rel} -> {du.dst_path}")
+            try:
+                uf = upload_executor.submit(upload_worker, du.it, du.jr, du.dst_path, du.idle_retry_attempt)
+            except Exception as e:
+                meta0 = UploadFutureInfo(
+                    it=du.it,
+                    jr=du.jr,
+                    dst_path=du.dst_path,
+                    idle_retry_attempt=max(0, du.idle_retry_attempt - 1),
+                )
+                _finalize_deferred_as_fail(meta0, msg=f"upload retry submit failed: {e}")
+                continue
+            upload_futs[uf] = UploadFutureInfo(
+                it=du.it,
+                jr=du.jr,
+                dst_path=du.dst_path,
+                idle_retry_attempt=du.idle_retry_attempt,
+            )
+
+    def acquire_upload_slot(*, timeout: float = 0.2) -> bool:
+        """
+        bounded backlog 的 acquire：
+        - 避免在“所有 slot 都被 deferred uploads 占用”时主线程永久阻塞（否则无法 pump 重试 -> 死锁）
+        - 在等待 slot 期间顺手 pump 一下 deferred uploads
+        """
+        if upload_slots is None:
+            return False
+        while not stop_event.is_set():
+            pump_deferred_uploads()
+            if upload_slots.acquire(timeout=timeout):
+                return True
+        return False
 
     def drain_upload_futs(*, block: bool, only_success: bool) -> None:
         nonlocal failed
@@ -4298,7 +4485,7 @@ def main() -> None:
             if not done:
                 break
             for fut in done:
-                it_ref = upload_futs.pop(fut, None)
+                meta = upload_futs.pop(fut, None)
                 try:
                     it2, jr = fut.result()
                 except FatalAuthError:
@@ -4307,11 +4494,14 @@ def main() -> None:
                     if only_success:
                         continue
                     failed += 1
-                    if it_ref is not None:
-                        record_fail(it_ref, f"upload exception: {e}")
+                    if meta is not None:
+                        record_fail(meta.it, f"upload exception: {e}")
                     log_err(f"[FAIL] upload exception: {e}")
-                    if it_ref is not None and not args.dry_run:
-                        safe_append("fail", it_ref, dst_rel=None)
+                    if meta is not None and not args.dry_run:
+                        safe_append("fail", meta.it, dst_rel=None)
+                    continue
+                if jr.action == "defer" and meta is not None and not only_success:
+                    _defer_upload(meta, err_msg=jr.msg)
                     continue
                 if only_success and not (jr.ok and jr.action in {"ok", "copy"}):
                     continue
@@ -4337,9 +4527,10 @@ def main() -> None:
                             if not args.dry_run:
                                 coord.locks.release(st.it.rel)
                             continue
-                        upload_slots.acquire()
+                        if not acquire_upload_slot():
+                            continue
                         try:
-                            uf = upload_executor.submit(upload_worker, st.it, st.jr, st.upload_dst_path)
+                            uf = upload_executor.submit(upload_worker, st.it, st.jr, st.upload_dst_path, 0)
                         except Exception as e:
                             try:
                                 upload_slots.release()
@@ -4349,10 +4540,16 @@ def main() -> None:
                             if not args.dry_run:
                                 coord.locks.release(st.it.rel)
                             continue
-                        upload_futs[uf] = st.it
+                        upload_futs[uf] = UploadFutureInfo(
+                            it=st.it,
+                            jr=st.jr,
+                            dst_path=st.upload_dst_path,
+                            idle_retry_attempt=0,
+                        )
                         # jobs=1 时主循环不 wait，因此这里顺手收割已完成的上传，
                         # 让 done 尽快写入 state（避免多设备重复跑）。
                         drain_upload_futs(block=False, only_success=False)
+                        pump_deferred_uploads()
                     else:
                         finalize(st.it, st.jr)
                 except FatalAuthError:
@@ -4364,8 +4561,17 @@ def main() -> None:
                     if not args.dry_run:
                         safe_append("fail", it, dst_rel=None)
 
-            # stop_event 被设置时，尽量把“已完成上传”的结果写入 done（不阻塞等待未完成的上传）
-            drain_upload_futs(block=not stop_event.is_set(), only_success=stop_event.is_set())
+            if stop_event.is_set():
+                # stop_event 被设置时，尽量把“已完成上传”的结果写入 done（不阻塞等待未完成的上传）
+                drain_upload_futs(block=False, only_success=True)
+            else:
+                # 正常退出：把 deferred uploads 也尽量跑完（失败会最终落 fail 并释放 lock/slot）
+                while upload_futs or deferred_uploads:
+                    pump_deferred_uploads()
+                    drain_upload_futs(block=bool(upload_futs), only_success=False)
+                    if not upload_futs and deferred_uploads:
+                        next_at = min(du.next_retry_at for du in deferred_uploads.values())
+                        time.sleep(max(0.0, min(0.5, next_at - time.time())))
         else:
             with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
                 proc_futs: Dict[cf.Future[StageResult], WorkItem] = {}
@@ -4387,12 +4593,20 @@ def main() -> None:
 
                 while True:
                     raise_if_fatal()
+                    pump_deferred_uploads()
                     try_submit_some(max(0, args.jobs - len(proc_futs)))
                     if not (proc_futs or upload_futs):
-                        if stop_event.is_set() or work_done:
+                        if stop_event.is_set() or (work_done and not deferred_uploads):
                             break
+                        # 当仅剩 deferred uploads 时，不要长时间阻塞在 work_q.get 上
+                        timeout0 = 0.5
+                        if deferred_uploads:
+                            next_at = min(du.next_retry_at for du in deferred_uploads.values())
+                            due_in = next_at - time.time()
+                            if due_in > 0:
+                                timeout0 = min(timeout0, due_in)
                         try:
-                            it0 = work_q.get(timeout=0.5)
+                            it0 = work_q.get(timeout=timeout0)
                         except queue.Empty:
                             continue
                         if it0 is None:
@@ -4403,6 +4617,11 @@ def main() -> None:
 
                     all_futs: List[cf.Future[Any]] = list(proc_futs.keys()) + list(upload_futs.keys())
                     timeout = 0.5 if not stop_event.is_set() else 0.0
+                    if deferred_uploads and not stop_event.is_set():
+                        next_at = min(du.next_retry_at for du in deferred_uploads.values())
+                        due_in = next_at - time.time()
+                        if due_in > 0:
+                            timeout = min(timeout, due_in)
                     done, _ = cf.wait(all_futs, timeout=timeout, return_when=cf.FIRST_COMPLETED)
                     if not done:
                         if stop_event.is_set():
@@ -4432,9 +4651,10 @@ def main() -> None:
                                         if not args.dry_run:
                                             coord.locks.release(st.it.rel)
                                     else:
-                                        upload_slots.acquire()
+                                        if not acquire_upload_slot():
+                                            continue
                                         try:
-                                            uf = upload_executor.submit(upload_worker, st.it, st.jr, st.upload_dst_path)
+                                            uf = upload_executor.submit(upload_worker, st.it, st.jr, st.upload_dst_path, 0)
                                         except Exception as e:
                                             try:
                                                 upload_slots.release()
@@ -4444,7 +4664,12 @@ def main() -> None:
                                             if not args.dry_run:
                                                 coord.locks.release(st.it.rel)
                                         else:
-                                            upload_futs[uf] = st.it
+                                            upload_futs[uf] = UploadFutureInfo(
+                                                it=st.it,
+                                                jr=st.jr,
+                                                dst_path=st.upload_dst_path,
+                                                idle_retry_attempt=0,
+                                            )
                             else:
                                 if stop_event.is_set() and not (st.jr.ok and st.jr.action in {"ok", "copy"}):
                                     # 中断时保持 processing/lock；成功的才记 done
@@ -4456,8 +4681,8 @@ def main() -> None:
                                 try_submit_some(1)
                             continue
 
-                        it_ref2 = upload_futs.pop(fut, None)
-                        if it_ref2 is None:
+                        meta2 = upload_futs.pop(fut, None)
+                        if meta2 is None:
                             continue
                         try:
                             it2, jr = fut.result()
@@ -4466,14 +4691,19 @@ def main() -> None:
                         except Exception as e:
                             if not stop_event.is_set():
                                 failed += 1
-                                record_fail(it_ref2, f"upload exception: {e}")
+                                record_fail(meta2.it, f"upload exception: {e}")
                                 log_err(f"[FAIL] upload exception: {e}")
                                 if not args.dry_run:
-                                    safe_append("fail", it_ref2, dst_rel=None)
+                                    safe_append("fail", meta2.it, dst_rel=None)
+                            continue
+                        if jr.action == "defer" and not stop_event.is_set():
+                            _defer_upload(meta2, err_msg=jr.msg)
+                            pump_deferred_uploads()
                             continue
                         if stop_event.is_set() and not (jr.ok and jr.action in {"ok", "copy"}):
                             continue
                         finalize(it2, jr)
+                        pump_deferred_uploads()
 
                 if stop_event.is_set():
                     # best-effort：写入已完成上传的 done（不阻塞等待未完成的上传）
