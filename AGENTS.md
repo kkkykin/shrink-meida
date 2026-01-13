@@ -37,12 +37,12 @@ shrink_media/
 └── cli.py             # 旧 CLI 入口（legacy）
 ```
 
-规划中的 C/S 目录（尚未完全落地，按 TODO 实施）：
+C/S 目录（已落地）：
 
 ```
 shrink_media_server/      # Server：任务调度 + OpenList 代理/能力下发 + finalize
   ├── api.py              # FastAPI 路由：register/lease/heartbeat/upload_intent/complete/fail
-  ├── db.py               # SQLite/Postgres 连接与迁移（建议先 SQLite）
+  ├── db.py               # SQLite 连接与迁移
   ├── models.py           # Task/Worker/Attempt 等模型
   ├── openlist.py         # 仅服务端使用的 OpenList 封装（生成下载直链/获取 direct-upload info/finalize）
   ├── planner.py          # route 规划 + 输出命名与 dst_rel 规划（强制 suffix）
@@ -73,9 +73,9 @@ Legacy CLI（仍可用，便于回归验证引擎行为）：
 - `python -m shrink_media.cli --help`
 - `python -m shrink_media.cli <input> -o <output> --dry-run`
 
-目标 C/S（落地后补齐具体命令；优先用 `uv run`）：
-- Server：`uv run -m shrink_media_server.api`
-- Worker：`uv run -m shrink_media_worker.worker --server <url>`
+C/S 模式（已实现）：
+- Server：`uv run -m shrink_media_server.api`（支持 `--scan-once` 单次扫描）
+- Worker：`uv run -m shrink_media_worker.worker --server <url>`（支持 `--once` 单次执行）
 
 Notes: real runs require `ffmpeg` and `ffprobe` in `PATH`. Comic/archive handling requires `7z`/`7zz`.
 
@@ -91,7 +91,7 @@ Notes: real runs require `ffmpeg` and `ffprobe` in `PATH`. Comic/archive handlin
 - Engine：用 `--dry-run` + 小样本目录验证“收益不足回退 copy / ffmpeg 失败回退 copy”。
 - Comic：验证 `7z` 存在/不存在、带密码/不带密码、smart-skip 行为。
 
-C/S 模式（落地后必须补的最小验证）：
+C/S 模式（已实现，需持续验证）：
 - Lease/heartbeat：任务超时回收与重派。
 - Zero-trust：worker 不持有 OpenList 凭证；只能上传到 staging，无法写任意路径。
 - Finalize：server 将 staging rename/move 到最终输出，size 校验正确，幂等（重复 complete 不产生脏数据）。
