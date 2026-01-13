@@ -36,6 +36,12 @@ class RegisterResponse(BaseModel):
     worker_token: str
 
 
+class WorkerMeResponse(BaseModel):
+    worker_id: int
+    name: str
+    caps: dict = Field(default_factory=dict)
+
+
 class LeaseRequest(BaseModel):
     worker_id: int = Field(ge=1)
     n: int = Field(default=1, ge=1, le=50)
@@ -243,6 +249,15 @@ def init_app() -> FastAPI:
         session.refresh(worker)
 
         return RegisterResponse(worker_id=worker.id, worker_token=worker_token)
+
+    @app.get("/v1/workers/me", response_model=WorkerMeResponse)
+    def worker_me(worker: Worker = Depends(authenticate_worker)) -> WorkerMeResponse:
+        """Return the authenticated worker info (token validation + worker_id discovery)."""
+        try:
+            caps = json.loads(worker.caps_json) if worker.caps_json else {}
+        except Exception:
+            caps = {}
+        return WorkerMeResponse(worker_id=worker.id, name=worker.name, caps=caps)
 
     @app.post("/v1/tasks/lease", response_model=LeaseResponse)
     def lease_tasks(

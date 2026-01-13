@@ -17,6 +17,7 @@ dependencies = [
 [project.scripts]
 shrink-media = "shrink_media.cli:main"
 shrink-media-server = "shrink_media_server.api:main"
+shrink-media-worker = "shrink_media_worker.worker:main"
 
 [[tool.uv.index]]
 url = "https://mirrors.ustc.edu.cn/pypi/simple/"

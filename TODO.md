@@ -32,18 +32,20 @@
 
 ## 1. 仓库结构与打包（可维护性优先）
 
-- [ ] 新增 packages（建议 top-level）：
+- [x] 新增 packages（建议 top-level）：
   - [x] `shrink_media_server/`（FastAPI + DB + OpenList 管理 + finalize）
-  - [ ] `shrink_media_worker/`（Worker loop + HTTP transport + capability 上报）
-- [ ] `pyproject.toml` 增加 scripts：
+  - [x] `shrink_media_worker/`（Worker loop + HTTP transport + capability 上报）
+- [x] `pyproject.toml` 增加 scripts：
   - [x] `shrink-media-server = shrink_media_server.api:main`
-  - [ ] `shrink-media-worker = shrink_media_worker.worker:main`
+  - [x] `shrink-media-worker = shrink_media_worker.worker:main`
 - [ ] 新增配置加载约定（全部通过 env/secret 注入）：
   - `SERVER_DB_URL`（默认 sqlite）
   - `OPENLIST_BASE_URL/OPENLIST_USER/OPENLIST_PASS/OPENLIST_OTP`
   - `ROUTES_JSON`（多组 in/out：`[{id,in_root,out_root,profile?}, ...]`）
   - `WORKER_TOKEN_*` / `WORKER_TOKENS`（bootstrap token，用于调用 `/v1/workers/register` 签发 worker token；worker token hash 落库）
- - [x] `.gitignore` 增加：
+  - `WORKER_SERVER_URL/WORKER_BOOTSTRAP_TOKEN/WORKER_TOKEN`（worker 端）
+  - `WORKER_NAME/WORKER_LEASE_BATCH_SIZE/WORKER_HEARTBEAT_INTERVAL`（worker 端）
+- [x] `.gitignore` 增加：
   - `.env`、`*.db`、`*.sqlite*`、`__pycache__/`、server/worker runtime logs
 
 ---
@@ -74,7 +76,7 @@
 
 ### 2.2 任务幂等键（避免重复建任务）
 - [x] 以 `(route_id, src_path, src_size, src_mtime_ns)` 作为“同一版本文件”的幂等键
-- [ ] 新版本文件（mtime/size 变化）允许生成新 task 或复用原 task 进入重跑
+- [ ] 新版本文件（mtime/size 变化）允许生成新 task 
 
 ---
 
@@ -102,7 +104,6 @@
 ### 4.1 鉴权
 - [x] Worker token：`Authorization: Bearer <token>`
 - [x] token 存储用 hash（不可明文落库）
-- [ ] 简单的 rate limit / IP allowlist（可选但建议）
 
 ### 4.2 接口清单
 - [x] `POST /v1/workers/register`
@@ -132,28 +133,29 @@
 
 ## 5. Worker：执行引擎封装（复用现有 shrink_media）
 
-- [ ] 把现有引擎整理成“可被 worker 调用的纯函数入口”
+- [x] 把现有引擎整理成“可被 worker 调用的纯函数入口”
   - 输入：`local_src_path + profile`
-  - 输出：`{action, out_local_path, out_ext, out_size, logs/metrics}`
+  - 输出：`{action, out_local_path, out_ext, out_size}`（metrics 暂留空）
   - 强制 `out-name-mode=suffix`（由 server 决策，worker 只遵从）
-- [ ] Worker 主循环
-  - [ ] register（一次）/ 加载 token
-  - [ ] lease N 个任务
-  - [ ] 对每个任务：
-    - 下载（GET `download.url`）到 tmp
-    - 调用 engine 转码（含 comic/7z）
-    - 计算 out_size/out_ext/action
-    - upload_intent 获取 staging upload capability
-    - 分块 PUT 上传（`Content-Range`），支持断点/重试
-    - complete（附带 metrics）
-  - [ ] heartbeat 线程/协程定时续租（长任务必需）
-  - [ ] SIGINT/SIGTERM：停止领取新任务，尽力完成当前任务或标记 fail
+- [x] Worker 主循环
+  - [x] register（一次）/ 加载 token
+  - [x] lease N 个任务
+  - [x] 对每个任务：
+    - [x] 下载（GET `download.url`）到 tmp
+    - [x] 调用 engine 转码（含 comic/7z）
+    - [x] 计算 out_size/out_ext/action
+    - [x] upload_intent 获取 staging upload capability
+    - [x] 分块 PUT 上传（`Content-Range`，含简单重试；断点续传 TODO）
+    - [x] complete（附带 metrics，当前为空 dict）
+  - [x] heartbeat 线程/协程定时续租（长任务必需）
+  - [x] SIGINT/SIGTERM：停止领取新任务（当前为强制退出，依赖 lease 超时回收）
+  - [ ] SIGINT/SIGTERM：尽力完成当前任务或显式 fail（优雅退出）
 
 ---
 
 ## 6. 兼容与迁移（把旧 CLI 变成“Engine 验证工具”）
 
-- [ ] 保留 `python -m shrink_media.cli` 作为 legacy 回归工具
+<!-- - [ ] 保留 `python -m shrink_media.cli` 作为 legacy 回归工具 -->
 - [ ] 新增 `shrink-media-worker --once`（只跑一次 lease，便于调试）
 - [ ] 新增 `shrink-media-server --scan-once`（扫描一次生成任务，便于调试）
 
@@ -163,7 +165,7 @@
 
 - [ ] Server 日志：每个 task_id 一条结构化日志（status/attempt/latency）
 - [ ] Worker 日志：下载/转码/上传耗时、ffmpeg rc、输出大小变化
-- [ ] 指标（可选但建议）：任务吞吐、失败率、平均耗时、按 codec 分类
+<!-- - [ ] 指标（可选但建议）：任务吞吐、失败率、平均耗时、按 codec 分类 -->
 - [ ] 管理接口（可选）：查看队列、死信重放、按路径过滤重跑
 
 ---
