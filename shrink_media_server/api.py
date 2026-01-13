@@ -68,7 +68,7 @@ class HeartbeatResponse(BaseModel):
 class UploadIntentRequest(BaseModel):
     worker_id: int = Field(ge=1)
     out_size: int = Field(ge=0)
-    out_ext: str = Field(default="", max_length=16, pattern=r"^$|^\\.?[A-Za-z0-9]{1,10}$")
+    out_ext: str = Field(default="", max_length=16, pattern=r"^$|^\.?[A-Za-z0-9]{1,10}$")
     action: Action
 
 
@@ -325,28 +325,7 @@ def init_app() -> FastAPI:
             raise HTTPException(status_code=403, detail="Worker mismatch")
 
         if task.status == "finalized":
-            if task.action == "skip":
-                if req.action != "skip":
-                    raise HTTPException(status_code=409, detail="action mismatch")
-                if task.out_size is not None and int(req.out_size) != int(task.out_size):
-                    raise HTTPException(status_code=409, detail="out_size mismatch")
-                return CompleteResponse(ok=True, message="Task already finalized")
-
-            if not task.final_path or task.out_size is None:
-                raise HTTPException(status_code=500, detail="Finalized task missing final_path/out_size")
-            if task.staging_path and req.staging_path != task.staging_path:
-                raise HTTPException(status_code=409, detail="staging_path mismatch")
-            if task.action and req.action != task.action:
-                raise HTTPException(status_code=409, detail="action mismatch")
-            if task.out_size is not None and int(req.out_size) != int(task.out_size):
-                raise HTTPException(status_code=409, detail="out_size mismatch")
-            final_info = openlist.info(task.final_path)
-            if not final_info:
-                raise HTTPException(status_code=500, detail="Finalized task missing final file")
-            final_size = int(getattr(final_info, "size", 0) or 0)
-            if final_size != int(task.out_size):
-                raise HTTPException(status_code=500, detail="Finalized task final size mismatch")
-            return CompleteResponse(ok=True, message="Task already finalized")
+            raise HTTPException(status_code=409, detail="Task already finalized")
 
         if task.lease_worker_id != worker.id:
             raise HTTPException(status_code=403, detail="Task not leased by this worker")
@@ -375,12 +354,6 @@ def init_app() -> FastAPI:
 
         if req.worker_id != worker.id:
             raise HTTPException(status_code=403, detail="Worker mismatch")
-
-        # Idempotency: allow retrying the same fail call after the server released the lease.
-        if task.status in {"queued", "deadletter"}:
-            if task.last_error == req.err:
-                return FailResponse(ok=True, message="Task already marked as failed")
-            raise HTTPException(status_code=409, detail="Task already released")
 
         if task.status == "finalized":
             raise HTTPException(status_code=409, detail="Task already finalized")
@@ -561,6 +534,30 @@ def init_app() -> FastAPI:
         if req.worker_id != worker.id:
             raise HTTPException(status_code=403, detail="Worker mismatch")
 
+        if task.status == "finalized":
+            if task.action == "skip":
+                if req.action != "skip":
+                    raise HTTPException(status_code=409, detail="action mismatch")
+                if task.out_size is not None and int(req.out_size) != int(task.out_size):
+                    raise HTTPException(status_code=409, detail="out_size mismatch")
+                return CompleteResponse(ok=True, message="Task already finalized")
+
+            if not task.final_path or task.out_size is None or not task.action:
+                raise HTTPException(status_code=500, detail="Finalized task missing final_path/out_size")
+            if task.staging_path and req.staging_path != task.staging_path:
+                raise HTTPException(status_code=409, detail="staging_path mismatch")
+            if req.action != task.action:
+                raise HTTPException(status_code=409, detail="action mismatch")
+            if int(req.out_size) != int(task.out_size):
+                raise HTTPException(status_code=409, detail="out_size mismatch")
+            final_info = openlist.info(task.final_path)
+            if not final_info:
+                raise HTTPException(status_code=500, detail="Finalized task missing final file")
+            final_size = int(getattr(final_info, "size", 0) or 0)
+            if final_size != int(task.out_size):
+                raise HTTPException(status_code=500, detail="Finalized task final size mismatch")
+            return CompleteResponse(ok=True, message="Task already finalized")
+
         if task.lease_worker_id != worker.id:
             raise HTTPException(status_code=403, detail="Task not leased by this worker")
 
@@ -671,6 +668,14 @@ def init_app() -> FastAPI:
 
         if req.worker_id != worker.id:
             raise HTTPException(status_code=403, detail="Worker mismatch")
+
+        # Idempotency: allow retrying the same fail call after the server released the lease.
+        if task.status in {"queued", "deadletter"}:
+            if task.last_error == req.err:
+                return FailResponse(ok=True, message="Task already marked as failed")
+            raise HTTPException(status_code=409, detail="Task already released")
+        if task.status == "finalized":
+            raise HTTPException(status_code=409, detail="Task already finalized")
 
         if task.lease_worker_id != worker.id:
             raise HTTPException(status_code=403, detail="Task not leased by this worker")
