@@ -1,11 +1,11 @@
 """Database models for shrink_media_server."""
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -29,6 +29,9 @@ class Worker(Base):
 class Task(Base):
     """Task represents a single file to be transcoded."""
     __tablename__ = "tasks"
+    __table_args__ = (
+        UniqueConstraint("route_id", "src_path", "src_size", "src_mtime_ns", name="uq_task_srcver"),
+    )
 
     id = Column(String(36), primary_key=True)  # UUID
     route_id = Column(String(255), nullable=False, index=True)
@@ -84,7 +87,11 @@ class Database:
     """Database connection and session management."""
 
     def __init__(self, db_url: str):
-        self.engine = create_engine(db_url, echo=False)
+        url = make_url(db_url)
+        connect_args = {}
+        if url.get_backend_name() == "sqlite":
+            connect_args["check_same_thread"] = False
+        self.engine = create_engine(db_url, echo=False, connect_args=connect_args)
         self.SessionLocal = sessionmaker(bind=self.engine)
 
     def create_tables(self):

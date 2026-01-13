@@ -1,6 +1,13 @@
 .snow
 _*
 __pycache__/
+.env
+
+*.db
+*.sqlite*
+*.log
+*.pid
+.venv/
 
 openlist_data/temp
 openlist_data/log

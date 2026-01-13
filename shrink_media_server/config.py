@@ -33,7 +33,8 @@ class ServerConfig:
     routes: List[Route]
 
     # Worker authentication
-    worker_tokens: List[str]
+    # NOTE: bootstrap tokens are only used for worker registration (issuing per-worker tokens).
+    bootstrap_tokens: List[str]
 
     # Server settings
     host: str
@@ -65,8 +66,17 @@ class ServerConfig:
             routes = cls._parse_routes(json.loads(routes_json))
 
         # Worker tokens
-        worker_tokens_str = os.getenv("WORKER_TOKENS", "dev-token-001")
-        worker_tokens = [t.strip() for t in worker_tokens_str.split(",") if t.strip()]
+        # Prefer WORKER_TOKEN_* env vars; fallback to WORKER_TOKENS comma list.
+        bootstrap_tokens = []
+        for k, v in os.environ.items():
+            if not k.startswith("WORKER_TOKEN_"):
+                continue
+            t = (v or "").strip()
+            if t:
+                bootstrap_tokens.append(t)
+        if not bootstrap_tokens:
+            worker_tokens_str = os.getenv("WORKER_TOKENS", "dev-token-001")
+            bootstrap_tokens = [t.strip() for t in worker_tokens_str.split(",") if t.strip()]
 
         # Server settings
         host = os.getenv("SERVER_HOST", "127.0.0.1")
@@ -79,7 +89,7 @@ class ServerConfig:
             openlist_password=openlist_password,
             openlist_otp=openlist_otp,
             routes=routes,
-            worker_tokens=worker_tokens,
+            bootstrap_tokens=bootstrap_tokens,
             host=host,
             port=port,
         )

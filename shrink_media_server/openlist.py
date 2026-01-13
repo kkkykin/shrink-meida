@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import posixpath
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
@@ -52,7 +53,6 @@ class OpenListManager:
         """
         try:
             from pathlib import Path
-            import httpx
 
             payload = {
                 "path": str(Path(dst_path).parent).replace("\\", "/"),
@@ -92,7 +92,7 @@ class OpenListManager:
                 return None
 
             return {
-                "upload_url": upload_url,
+                "url": upload_url,
                 "method": method,
                 "chunk_size": chunk_size,
                 "headers": {},
@@ -106,11 +106,35 @@ class OpenListManager:
 
     def info(self, path: str):
         """Get file/directory info."""
-        return self.client.info(path)
+        info = self.client.info(path)
+        if info is None:
+            return None
+        name = getattr(info, "name", None)
+        p = getattr(info, "path", None)
+        sign0 = getattr(info, "sign", None)
+        size0 = getattr(info, "size", None)
+        modified0 = getattr(info, "modified", None)
+        if (
+            name in (None, "")
+            and p in (None, "")
+            and sign0 in (None, "")
+            and (size0 in (None, 0))
+            and modified0 is None
+        ):
+            return None
+        return info
 
     def listdir(self, path: str, refresh: bool = True):
         """List directory contents."""
         return self.client.listdir(path, refresh=refresh)
+
+    def download_to(self, remote_path: str, local_path: Path) -> None:
+        """Download a file to local filesystem (proxy fallback)."""
+        self.client.download_to(remote_path, local_path)
+
+    def upload_file(self, remote_path: str, local_file: Path, *, overwrite: bool) -> None:
+        """Upload a local file to OpenList (proxy fallback)."""
+        self.client.upload_file(remote_path, local_file, overwrite=overwrite)
 
     def rename(self, src: str, dst: str):
         """Rename/move a file."""
