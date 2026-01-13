@@ -1,0 +1,11 @@
+# Copy this file to `pass.txt` (ignored by git) and fill your local OpenList test credentials.
+# Routes (in_root/out_root) are configured separately in `routes.json` (copy from `routes.example.json`).
+#
+# Example:
+#   user=admin
+#   pass=admin
+#   base_url=http://127.0.0.1:15244
+
+user=
+pass=
+base_url=http://127.0.0.1:15244

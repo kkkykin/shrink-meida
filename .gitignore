@@ -1,2 +1,21 @@
 .snow
 _*
+__pycache__/
+
+openlist_data/temp
+openlist_data/log
+openlist_data/data.db-wal
+openlist_data/data.db-shm
+openlist_data/test
+
+# local secrets / local config
+pass.txt
+pass_*.txt
+routes.json
+
+# shrink-media runtime artifacts
+.shrink_media_state.jsonl
+.shrink_media_state/
+.shrink_media_locks/
+.shrink_media_staging/
+.__tmp__*
