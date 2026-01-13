@@ -178,3 +178,52 @@ class TestShrinkMediaServerApi(ServerHarness):
         self.assertEqual(task.status, "leased")
         self.assertEqual(int(task.lease_worker_id), w2_id)
 
+    def test_admin_endpoints_require_bootstrap_token(self) -> None:
+        r = self.client.get("/v1/admin/tasks")
+        self.assertEqual(r.status_code, 401)
+
+        r = self.client.get("/v1/admin/tasks", headers=self._auth_headers("bad-token"))
+        self.assertEqual(r.status_code, 401)
+
+    def test_admin_requeue_tasks_filters_and_updates(self) -> None:
+        task_deadletter = self.create_task(status="deadletter", attempts=3)
+        task_failed = self.create_task(status="failed", attempts=2, src_path="/in/b.mov", src_rel="b.mov", src_mtime_ns=2)
+
+        r = self.client.get(
+            "/v1/admin/tasks?status=deadletter",
+            headers=self._auth_headers(self.bootstrap_token),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(r.json()["tasks"]), 1)
+        self.assertEqual(r.json()["tasks"][0]["task_id"], task_deadletter)
+
+        r = self.client.post(
+            "/v1/admin/tasks/requeue",
+            headers=self._auth_headers(self.bootstrap_token),
+            json={"status_in": ["deadletter"], "reset_attempts": True, "limit": 10},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["ok"])
+        self.assertEqual(r.json()["updated"], 1)
+
+        t1 = self.get_task(task_deadletter)
+        self.assertIsNotNone(t1)
+        self.assertEqual(t1.status, "queued")
+        self.assertEqual(int(t1.attempts), 0)
+
+        t2 = self.get_task(task_failed)
+        self.assertIsNotNone(t2)
+        self.assertEqual(t2.status, "failed")
+
+        r = self.client.post(
+            f"/v1/admin/tasks/{task_failed}/requeue?reset_attempts=0",
+            headers=self._auth_headers(self.bootstrap_token),
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["ok"])
+        self.assertEqual(r.json()["updated"], 1)
+
+        t2b = self.get_task(task_failed)
+        self.assertIsNotNone(t2b)
+        self.assertEqual(t2b.status, "queued")
+        self.assertEqual(int(t2b.attempts), 2)

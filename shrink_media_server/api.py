@@ -3,15 +3,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import secrets
 import shutil
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Literal, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
@@ -20,6 +22,8 @@ from .config import ServerConfig
 from .models import Attempt, Database, Task, Worker
 from .openlist import OpenListManager
 from shrink_media.workitem import build_suffixed_target_name, normalize_ext
+
+logger = logging.getLogger(__name__)
 
 
 Action = Literal["ok", "copy", "skip"]
@@ -111,6 +115,42 @@ class FailRequest(BaseModel):
 class FailResponse(BaseModel):
     ok: bool
     message: str
+
+
+class AdminTaskInfo(BaseModel):
+    task_id: str
+    route_id: str
+    src_path: str
+    src_rel: str
+    status: str
+    attempts: int
+    max_attempts: int
+    lease_worker_id: Optional[int] = None
+    lease_expires_at: Optional[str] = None
+    action: Optional[str] = None
+    out_size: Optional[int] = None
+    staging_path: Optional[str] = None
+    final_path: Optional[str] = None
+    last_error: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class AdminListTasksResponse(BaseModel):
+    tasks: list[AdminTaskInfo]
+
+
+class AdminRequeueRequest(BaseModel):
+    status_in: list[str] = Field(default_factory=lambda: ["deadletter"])
+    route_id: Optional[str] = Field(default=None, max_length=255)
+    src_path_prefix: Optional[str] = Field(default=None, max_length=2048)
+    reset_attempts: bool = True
+    limit: int = Field(default=1000, ge=1, le=10000)
+
+
+class AdminRequeueResponse(BaseModel):
+    ok: bool
+    updated: int
 
 
 # Global state
@@ -305,6 +345,18 @@ def init_app() -> FastAPI:
                 profile = json.loads(task.profile_json) if task.profile_json else {}
             except Exception:
                 profile = {}
+
+            logger.info(
+                "Task leased",
+                extra={
+                    "task_id": task.id,
+                    "worker_id": worker.id,
+                    "route_id": task.route_id,
+                    "src_path": task.src_path,
+                    "attempt": task.attempts,
+                    "status": "leased",
+                },
+            )
 
             leased_tasks.append(
                 TaskInfo(
@@ -542,6 +594,7 @@ def init_app() -> FastAPI:
         worker: Worker = Depends(authenticate_worker),
     ):
         """Mark task as complete and finalize output."""
+        start_time = time.time()
         task = session.query(Task).filter(Task.id == task_id).first()
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
@@ -605,6 +658,20 @@ def init_app() -> FastAPI:
             )
             session.add(attempt)
             session.commit()
+
+            latency_ms = int((time.time() - start_time) * 1000)
+            logger.info(
+                "Task completed (skip)",
+                extra={
+                    "task_id": task_id,
+                    "worker_id": worker.id,
+                    "route_id": task.route_id,
+                    "action": "skip",
+                    "attempt": task.attempts,
+                    "status": "finalized",
+                    "latency_ms": latency_ms,
+                },
+            )
             return CompleteResponse(ok=True, message="Task skipped")
 
         if not task.staging_path or not task.final_path or task.out_size is None or not task.action:
@@ -634,6 +701,20 @@ def init_app() -> FastAPI:
                 task.lease_worker_id = None
                 task.lease_expires_at = None
                 session.commit()
+
+                latency_ms = int((time.time() - start_time) * 1000)
+                logger.info(
+                    "Task completed (already finalized)",
+                    extra={
+                        "task_id": task_id,
+                        "worker_id": worker.id,
+                        "route_id": task.route_id,
+                        "action": task.action,
+                        "attempt": task.attempts,
+                        "status": "finalized",
+                        "latency_ms": latency_ms,
+                    },
+                )
                 return CompleteResponse(ok=True, message="Task already finalized")
 
         # Finalize staging to final
@@ -663,6 +744,23 @@ def init_app() -> FastAPI:
         )
         session.add(attempt)
         session.commit()
+
+        latency_ms = int((time.time() - start_time) * 1000)
+        logger.info(
+            "Task completed",
+            extra={
+                "task_id": task_id,
+                "worker_id": worker.id,
+                "route_id": task.route_id,
+                "action": task.action,
+                "attempt": task.attempts,
+                "status": task.status,
+                "ok": result["ok"],
+                "latency_ms": latency_ms,
+                "src_size": task.src_size,
+                "out_size": task.out_size,
+            },
+        )
 
         return CompleteResponse(
             ok=result["ok"],
@@ -723,6 +821,19 @@ def init_app() -> FastAPI:
         session.add(attempt)
         session.commit()
 
+        logger.warning(
+            "Task failed",
+            extra={
+                "task_id": task_id,
+                "worker_id": worker.id,
+                "route_id": task.route_id,
+                "attempt": task.attempts,
+                "status": task.status,
+                "retryable": req.retryable,
+                "error": req.err[:200],  # Truncate long errors
+            },
+        )
+
         return FailResponse(ok=True, message="Task marked as failed")
 
     @app.get("/health")
@@ -730,14 +841,151 @@ def init_app() -> FastAPI:
         """Health check endpoint."""
         return {"status": "ok"}
 
+    @app.get("/v1/admin/tasks", response_model=AdminListTasksResponse)
+    def admin_list_tasks(
+        status: Optional[str] = Query(default=None, max_length=32),
+        route_id: Optional[str] = Query(default=None, max_length=255),
+        src_path_prefix: Optional[str] = Query(default=None, max_length=2048),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        session: Session = Depends(get_db),
+        token: str = Depends(require_bootstrap_token),
+    ):
+        """List tasks for operational debugging (requires bootstrap token)."""
+        _ = token
+        q = session.query(Task).order_by(Task.updated_at.desc())
+        if status:
+            q = q.filter(Task.status == status)
+        if route_id:
+            q = q.filter(Task.route_id == route_id)
+        if src_path_prefix:
+            q = q.filter(Task.src_path.startswith(src_path_prefix))
+
+        tasks = q.offset(offset).limit(limit).all()
+
+        out: list[AdminTaskInfo] = []
+        for t in tasks:
+            out.append(
+                AdminTaskInfo(
+                    task_id=t.id,
+                    route_id=t.route_id,
+                    src_path=t.src_path,
+                    src_rel=t.src_rel,
+                    status=t.status,
+                    attempts=int(t.attempts or 0),
+                    max_attempts=int(t.max_attempts or 0),
+                    lease_worker_id=int(t.lease_worker_id) if t.lease_worker_id is not None else None,
+                    lease_expires_at=t.lease_expires_at.isoformat() if t.lease_expires_at else None,
+                    action=t.action,
+                    out_size=int(t.out_size) if t.out_size is not None else None,
+                    staging_path=t.staging_path,
+                    final_path=t.final_path,
+                    last_error=(t.last_error[:200] if t.last_error else None),
+                    created_at=t.created_at.isoformat(),
+                    updated_at=t.updated_at.isoformat(),
+                )
+            )
+
+        return AdminListTasksResponse(tasks=out)
+
+    @app.post("/v1/admin/tasks/requeue", response_model=AdminRequeueResponse)
+    def admin_requeue_tasks(
+        req: AdminRequeueRequest,
+        session: Session = Depends(get_db),
+        token: str = Depends(require_bootstrap_token),
+    ):
+        """Requeue failed/deadletter tasks (requires bootstrap token)."""
+        _ = token
+        if not req.status_in:
+            raise HTTPException(status_code=400, detail="status_in must not be empty")
+
+        q = session.query(Task).filter(Task.status.in_(req.status_in))
+        if req.route_id:
+            q = q.filter(Task.route_id == req.route_id)
+        if req.src_path_prefix:
+            q = q.filter(Task.src_path.startswith(req.src_path_prefix))
+
+        tasks = q.limit(req.limit).all()
+        now = datetime.now(timezone.utc)
+        updated = 0
+        for t in tasks:
+            if t.status == "finalized":
+                continue
+            t.status = "queued"
+            if req.reset_attempts:
+                t.attempts = 0
+            t.last_error = None
+            t.lease_worker_id = None
+            t.lease_expires_at = None
+            t.staging_path = None
+            t.final_path = None
+            t.action = None
+            t.out_size = None
+            t.updated_at = now
+            updated += 1
+
+        session.commit()
+        return AdminRequeueResponse(ok=True, updated=updated)
+
+    @app.post("/v1/admin/tasks/{task_id}/requeue", response_model=AdminRequeueResponse)
+    def admin_requeue_task(
+        task_id: str,
+        reset_attempts: bool = True,
+        session: Session = Depends(get_db),
+        token: str = Depends(require_bootstrap_token),
+    ):
+        """Requeue a single task by id (requires bootstrap token)."""
+        _ = token
+        task = session.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task.status == "finalized":
+            raise HTTPException(status_code=409, detail="Task already finalized")
+
+        now = datetime.now(timezone.utc)
+        task.status = "queued"
+        if reset_attempts:
+            task.attempts = 0
+        task.last_error = None
+        task.lease_worker_id = None
+        task.lease_expires_at = None
+        task.staging_path = None
+        task.final_path = None
+        task.action = None
+        task.out_size = None
+        task.updated_at = now
+        session.commit()
+
+        return AdminRequeueResponse(ok=True, updated=1)
+
     return app
 
 
 def main():
     """Main entry point for the server."""
+    import argparse
     import uvicorn
 
+    parser = argparse.ArgumentParser(description="shrink_media server")
+    parser.add_argument("--scan-once", action="store_true", help="Scan routes once to generate tasks and exit (for debugging)")
+    args = parser.parse_args()
+
     app = init_app()
+
+    if args.scan_once:
+        from .scanner import scan_all_routes
+
+        print("Scanning routes once...")
+        session = db.get_session()
+        try:
+            summary = scan_all_routes(config, openlist, session)
+            print("\nScan complete:")
+            for route_id, counts in summary.items():
+                print(f"  {route_id}: created={counts['created']}, skipped={counts['skipped']}")
+        finally:
+            session.close()
+        return
+
     uvicorn.run(app, host=config.host, port=config.port)
 
 

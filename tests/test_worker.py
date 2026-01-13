@@ -229,6 +229,104 @@ class TestWorkerProcessFlow(ServerHarness):
         self.assertEqual(task_obj.final_path, f"{self.out_root}/a__mov.mp4")
         self.assertIn(task_obj.final_path, self.openlist.files)
 
+    def test_process_task_audio_uploads_and_completes(self) -> None:
+        worker_id, worker_token = self.register_worker()
+        task_id = self.create_task(src_path="/in/song.mp3", src_rel="song.mp3", src_size=8)
+        task = self._lease_one(worker_id=worker_id, worker_token=worker_token)
+        self.assertEqual(task["task_id"], task_id)
+
+        worker = self._make_worker(worker_id=worker_id, worker_token=worker_token)
+
+        def fake_download(_url: str, dest: Path, *, headers: dict | None = None, timeout: int = 300) -> None:
+            dest.write_bytes(b"x" * int(task["src_size"]))
+
+        def fake_process_one_local(**kwargs: Any):
+            out_local = Path(kwargs["out_root"]) / "out.m4a"
+            out_local.write_bytes(b"y" * 9)
+            return _FakeProcessResult(ok=True, action="ok", msg="ok", out_local=out_local)
+
+        def fake_upload_file_chunked(
+            url: str,
+            src: Path,
+            *,
+            method: str = "PUT",
+            chunk_size: int = 5 * 1024 * 1024,
+            headers: dict | None = None,
+            timeout: int = 300,
+        ) -> dict:
+            headers = headers or {}
+            self.assertEqual(method.upper(), "PUT")
+            self.assertEqual(headers.get("Authorization"), f"Bearer {worker_token}")
+
+            path = _url_to_testclient_path(url)
+            resp = self.client.request(method, path, content=src.read_bytes(), headers=headers)
+            self.assertEqual(resp.status_code, 200, resp.text)
+            return resp.json()
+
+        with (
+            patch("shrink_media_worker.worker.download_file", side_effect=fake_download),
+            patch("shrink_media_worker.worker.process_one_local", side_effect=fake_process_one_local),
+            patch("shrink_media_worker.worker.upload_file_chunked", side_effect=fake_upload_file_chunked),
+            patch("builtins.print"),
+        ):
+            worker.process_task(task)
+
+        task_obj = self.get_task(task_id)
+        self.assertIsNotNone(task_obj)
+        self.assertEqual(task_obj.status, "finalized")
+        self.assertEqual(task_obj.action, "ok")
+        self.assertEqual(task_obj.final_path, f"{self.out_root}/song__mp3.m4a")
+        self.assertIn(task_obj.final_path, self.openlist.files)
+
+    def test_process_task_comic_uploads_and_completes(self) -> None:
+        worker_id, worker_token = self.register_worker()
+        task_id = self.create_task(src_path="/in/comic.zip", src_rel="comic.zip", src_size=8)
+        task = self._lease_one(worker_id=worker_id, worker_token=worker_token)
+        self.assertEqual(task["task_id"], task_id)
+
+        worker = self._make_worker(worker_id=worker_id, worker_token=worker_token)
+
+        def fake_download(_url: str, dest: Path, *, headers: dict | None = None, timeout: int = 300) -> None:
+            dest.write_bytes(b"x" * int(task["src_size"]))
+
+        def fake_process_one_local(**kwargs: Any):
+            out_local = Path(kwargs["out_root"]) / "out.cbz"
+            out_local.write_bytes(b"y" * 9)
+            return _FakeProcessResult(ok=True, action="ok", msg="ok", out_local=out_local)
+
+        def fake_upload_file_chunked(
+            url: str,
+            src: Path,
+            *,
+            method: str = "PUT",
+            chunk_size: int = 5 * 1024 * 1024,
+            headers: dict | None = None,
+            timeout: int = 300,
+        ) -> dict:
+            headers = headers or {}
+            self.assertEqual(method.upper(), "PUT")
+            self.assertEqual(headers.get("Authorization"), f"Bearer {worker_token}")
+
+            path = _url_to_testclient_path(url)
+            resp = self.client.request(method, path, content=src.read_bytes(), headers=headers)
+            self.assertEqual(resp.status_code, 200, resp.text)
+            return resp.json()
+
+        with (
+            patch("shrink_media_worker.worker.download_file", side_effect=fake_download),
+            patch("shrink_media_worker.worker.process_one_local", side_effect=fake_process_one_local),
+            patch("shrink_media_worker.worker.upload_file_chunked", side_effect=fake_upload_file_chunked),
+            patch("builtins.print"),
+        ):
+            worker.process_task(task)
+
+        task_obj = self.get_task(task_id)
+        self.assertIsNotNone(task_obj)
+        self.assertEqual(task_obj.status, "finalized")
+        self.assertEqual(task_obj.action, "ok")
+        self.assertEqual(task_obj.final_path, f"{self.out_root}/comic__zip.cbz")
+        self.assertIn(task_obj.final_path, self.openlist.files)
+
     def test_process_task_skip_completes_without_upload(self) -> None:
         worker_id, worker_token = self.register_worker()
         task_id = self.create_task(src_path="/in/a.mov", src_rel="a.mov", src_size=11)

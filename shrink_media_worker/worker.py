@@ -1,9 +1,9 @@
 """Worker main loop for shrink_media C/S architecture."""
 from __future__ import annotations
 
+import logging
 import os
 import signal
-import sys
 import tempfile
 import threading
 import time
@@ -17,6 +17,8 @@ from shrink_media.processor import process_one_local
 
 from .caps import detect_capabilities
 from .transport import download_file, upload_file_chunked
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -59,15 +61,21 @@ class Worker:
         self.worker_token: Optional[str] = config.worker_token
         self.client = httpx.Client(timeout=300.0)
         self.running = True
+        self.shutting_down = False
         self.active_tasks_lock = threading.Lock()
         self.active_tasks: dict[str, dict] = {}
         self.heartbeat_thread: Optional[threading.Thread] = None
+        self.current_task_id: Optional[str] = None
 
     def _auth_headers(self) -> dict[str, str]:
         """Get authorization headers."""
         if not self.worker_token:
             raise RuntimeError("Worker not registered")
         return {"Authorization": f"Bearer {self.worker_token}"}
+
+    def request_shutdown(self) -> None:
+        """Request graceful shutdown (stop leasing new tasks)."""
+        self.shutting_down = True
 
     def register(self) -> None:
         """Register worker with server."""
@@ -139,10 +147,14 @@ class Worker:
     def process_task(self, task: dict) -> None:
         """Process a single task."""
         task_id = task["task_id"]
+        task_start = time.time()
         with self.active_tasks_lock:
             self.active_tasks[task_id] = task
+            self.current_task_id = task_id
 
         try:
+            if self.shutting_down:
+                raise RuntimeError("Worker shutting down")
             print(f"\n[{task_id}] Processing {task['src_rel']}")
 
             # Download source
@@ -161,7 +173,17 @@ class Worker:
                     download_headers = self._auth_headers()
 
                 print(f"[{task_id}] Downloading from {download_url}")
+                dl_start = time.time()
                 download_file(download_url, src_local, headers=download_headers)
+                dl_time = time.time() - dl_start
+                logger.info(
+                    "Download complete",
+                    extra={
+                        "task_id": task_id,
+                        "download_time_s": round(dl_time, 2),
+                        "size_bytes": task["src_size"],
+                    },
+                )
 
                 # Parse profile
                 profile = task.get("profile", {})
@@ -180,6 +202,7 @@ class Worker:
 
                 # Process
                 print(f"[{task_id}] Transcoding...")
+                transcode_start = time.time()
                 result = process_one_local(
                     src_local=src_in_root,
                     in_root=in_root,
@@ -208,6 +231,19 @@ class Worker:
                     archive_password=profile.get("archive_password"),
                     out_name_mode="suffix",
                     src_size_hint=task["src_size"],
+                )
+                transcode_time = time.time() - transcode_start
+
+                logger.info(
+                    "Transcode complete",
+                    extra={
+                        "task_id": task_id,
+                        "transcode_time_s": round(transcode_time, 2),
+                        "ok": result.ok,
+                        "action": result.action,
+                        "ffmpeg_rc": getattr(result, "ffmpeg_rc", None),
+                        "msg": result.msg[:200] if result.msg else None,
+                    },
                 )
 
                 if not result.ok:
@@ -270,12 +306,27 @@ class Worker:
                 elif upload_url.startswith(self.config.server_url):
                     upload_headers.setdefault("Authorization", self._auth_headers()["Authorization"])
 
+                upload_start = time.time()
                 upload_file_chunked(
                     upload_url,
                     result.out_local,
                     method=upload_info.get("method", "PUT"),
                     chunk_size=upload_info.get("chunk_size", 5 * 1024 * 1024),
                     headers=upload_headers,
+                )
+                upload_time = time.time() - upload_start
+
+                src_size = task["src_size"]
+                size_change_pct = ((out_size - src_size) / src_size * 100) if src_size > 0 else 0
+                logger.info(
+                    "Upload complete",
+                    extra={
+                        "task_id": task_id,
+                        "upload_time_s": round(upload_time, 2),
+                        "src_size": src_size,
+                        "out_size": out_size,
+                        "size_change_pct": round(size_change_pct, 1),
+                    },
                 )
 
                 # Complete
@@ -296,9 +347,28 @@ class Worker:
                 if not complete_data.get("ok"):
                     raise RuntimeError(complete_data.get("message", "Complete failed"))
 
+                task_time = time.time() - task_start
+                logger.info(
+                    "Task completed successfully",
+                    extra={
+                        "task_id": task_id,
+                        "total_time_s": round(task_time, 2),
+                        "action": action,
+                        "msg": result.msg[:200] if result.msg else None,
+                    },
+                )
                 print(f"[{task_id}] Completed ({action}): {result.msg}")
 
         except Exception as e:
+            task_time = time.time() - task_start
+            logger.error(
+                "Task failed",
+                extra={
+                    "task_id": task_id,
+                    "total_time_s": round(task_time, 2),
+                    "error": str(e)[:200],
+                },
+            )
             print(f"[{task_id}] Failed: {e}")
             try:
                 resp = self.client.post(
@@ -316,8 +386,10 @@ class Worker:
         finally:
             with self.active_tasks_lock:
                 self.active_tasks.pop(task_id, None)
+                if self.current_task_id == task_id:
+                    self.current_task_id = None
 
-    def run(self) -> None:
+    def run(self, once: bool = False) -> None:
         """Main worker loop."""
         # Register
         self.register()
@@ -330,17 +402,27 @@ class Worker:
         print("\nWorker started, waiting for tasks...")
         while self.running:
             try:
+                if self.shutting_down:
+                    break
+
                 # Lease tasks
                 tasks = self.lease_tasks()
                 if not tasks:
+                    if once:
+                        print("No tasks available (--once mode)")
+                        break
                     time.sleep(5)
                     continue
 
                 # Process tasks
                 for task in tasks:
-                    if not self.running:
+                    if not self.running or self.shutting_down:
                         break
                     self.process_task(task)
+
+                if once:
+                    print("Completed one lease cycle (--once mode)")
+                    break
 
             except KeyboardInterrupt:
                 print("\nShutting down...")
@@ -348,34 +430,48 @@ class Worker:
                 break
             except Exception as e:
                 print(f"Error in main loop: {e}")
+                if once:
+                    break
                 time.sleep(5)
 
         print("Worker stopped")
 
-    def shutdown(self) -> None:
+    def shutdown(self, graceful: bool = True) -> None:
         """Graceful shutdown."""
+        _ = graceful
+        self.shutting_down = True
         self.running = False
+
         if self.heartbeat_thread:
             self.heartbeat_thread.join(timeout=5)
+            self.heartbeat_thread = None
         self.client.close()
 
 
 def main() -> None:
     """Main entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="shrink_media worker")
+    parser.add_argument("--once", action="store_true", help="Run one lease cycle and exit (for debugging)")
+    args = parser.parse_args()
+
     config = WorkerConfig.from_env()
     worker = Worker(config)
 
     # Handle signals
     def signal_handler(signum, frame):
-        print(f"\nReceived signal {signum}, shutting down...")
-        worker.shutdown()
-        sys.exit(0)
+        _ = frame
+        if worker.shutting_down:
+            os._exit(128 + int(signum))
+        print(f"\nReceived signal {signum}, requesting shutdown...")
+        worker.request_shutdown()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        worker.run()
+        worker.run(once=args.once)
     finally:
         worker.shutdown()
 

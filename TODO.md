@@ -38,7 +38,7 @@
 - [x] `pyproject.toml` 增加 scripts：
   - [x] `shrink-media-server = shrink_media_server.api:main`
   - [x] `shrink-media-worker = shrink_media_worker.worker:main`
-- [ ] 新增配置加载约定（全部通过 env/secret 注入）：
+- [x] 新增配置加载约定（全部通过 env/secret 注入）：
   - `SERVER_DB_URL`（默认 sqlite）
   - `OPENLIST_BASE_URL/OPENLIST_USER/OPENLIST_PASS/OPENLIST_OTP`
   - `ROUTES_JSON`（多组 in/out：`[{id,in_root,out_root,profile?}, ...]`）
@@ -75,8 +75,8 @@
   - `task_id, worker_id, started_at, finished_at, ok, action, err, metrics_json`
 
 ### 2.2 任务幂等键（避免重复建任务）
-- [x] 以 `(route_id, src_path, src_size, src_mtime_ns)` 作为“同一版本文件”的幂等键
-- [ ] 新版本文件（mtime/size 变化）允许生成新 task 
+- [x] 以 `(route_id, src_path, src_size, src_mtime_ns)` 作为"同一版本文件"的幂等键
+- [x] 新版本文件（mtime/size 变化）允许生成新 task 
 
 ---
 
@@ -149,32 +149,32 @@
     - [x] complete（附带 metrics，当前为空 dict）
   - [x] heartbeat 线程/协程定时续租（长任务必需）
   - [x] SIGINT/SIGTERM：停止领取新任务（当前为强制退出，依赖 lease 超时回收）
-  - [ ] SIGINT/SIGTERM：尽力完成当前任务或显式 fail（优雅退出）
+  - [x] SIGINT/SIGTERM：尽力完成当前任务或显式 fail（优雅退出）
 
 ---
 
-## 6. 兼容与迁移（把旧 CLI 变成“Engine 验证工具”）
+## 6. 兼容与迁移（把旧 CLI 变成"Engine 验证工具"）
 
 <!-- - [ ] 保留 `python -m shrink_media.cli` 作为 legacy 回归工具 -->
-- [ ] 新增 `shrink-media-worker --once`（只跑一次 lease，便于调试）
-- [ ] 新增 `shrink-media-server --scan-once`（扫描一次生成任务，便于调试）
+- [x] 新增 `shrink-media-worker --once`（只跑一次 lease，便于调试）
+- [x] 新增 `shrink-media-server --scan-once`（扫描一次生成任务，便于调试）
 
 ---
 
 ## 7. 运维与可观测性（上线前必须有）
 
-- [ ] Server 日志：每个 task_id 一条结构化日志（status/attempt/latency）
-- [ ] Worker 日志：下载/转码/上传耗时、ffmpeg rc、输出大小变化
+- [x] Server 日志：每个 task_id 一条结构化日志（status/attempt/latency）
+- [x] Worker 日志：下载/转码/上传耗时、ffmpeg rc、输出大小变化
 <!-- - [ ] 指标（可选但建议）：任务吞吐、失败率、平均耗时、按 codec 分类 -->
-- [ ] 管理接口（可选）：查看队列、死信重放、按路径过滤重跑
+- [x] 管理接口（可选）：查看队列、死信重放、按路径过滤重跑
 
 ---
 
 ## 8. 验收标准（Definition of Done）
 
-- [ ] Worker 完全不需要 OpenList 凭证，且无法写入非 staging 的 OpenList 路径
-- [ ] 同一批输入可被多个 worker 并行处理，server lease 可回收、可重派
-- [ ] 输出路径命名稳定、可预测；重复 complete/重启不会制造重复文件或脏状态
-- [ ] 断网/服务端重启/worker 崩溃后可自动恢复
-- [ ] 多组 routes（例如 /a->/b 与 /c->/d）可同时运行，且任务/输出隔离正确
-- [ ] 至少覆盖：video/audio/image/comic 四类任务的端到端跑通
+- [x] Worker 完全不需要 OpenList 凭证，且无法写入非 staging 的 OpenList 路径
+- [x] 同一批输入可被多个 worker 并行处理，server lease 可回收、可重派
+- [x] 输出路径命名稳定、可预测；重复 complete/重启不会制造重复文件或脏状态
+- [x] 断网/服务端重启/worker 崩溃后可自动恢复
+- [x] 多组 routes（例如 /a->/b 与 /c->/d）可同时运行，且任务/输出隔离正确
+- [x] 至少覆盖：video/audio/image/comic 四类任务的端到端跑通
