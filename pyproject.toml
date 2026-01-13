@@ -8,10 +8,15 @@ dependencies = [
     "openlist",
     "tenacity>=8.2",
     "rich>=13.7",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "sqlalchemy>=2.0",
+    "pydantic>=2.0",
 ]
 
 [project.scripts]
 shrink-media = "shrink_media.cli:main"
+shrink-media-server = "shrink_media_server.api:main"
 
 [[tool.uv.index]]
 url = "https://mirrors.ustc.edu.cn/pypi/simple/"
