@@ -19,6 +19,8 @@ openlist_data/test
 pass.txt
 pass_*.txt
 routes.json
+server.yaml
+server.yml
 
 # shrink-media runtime artifacts
 .shrink_media_state.jsonl

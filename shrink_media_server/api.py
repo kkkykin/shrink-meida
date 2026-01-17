@@ -211,11 +211,11 @@ def _is_task_staging_path(*, path: str, out_root: str, task_id: str) -> bool:
         return False
 
 
-def init_app() -> FastAPI:
+def init_app(*, config_file: Path | None = None) -> FastAPI:
     """Initialize FastAPI application."""
     global config, db, openlist
 
-    config = ServerConfig.from_env()
+    config = ServerConfig.load(config_file=config_file)
     db = Database(config.db_url)
     db.create_tables()
     openlist = OpenListManager(
@@ -968,10 +968,11 @@ def main():
     import uvicorn
 
     parser = argparse.ArgumentParser(description="shrink_media server")
+    parser.add_argument("--config", type=Path, default=None, help="Server YAML config file path (env: SERVER_CONFIG_FILE)")
     parser.add_argument("--scan-once", action="store_true", help="Scan routes once to generate tasks and exit (for debugging)")
     args = parser.parse_args()
 
-    app = init_app()
+    app = init_app(config_file=args.config)
 
     if args.scan_once:
         from .scanner import scan_all_routes

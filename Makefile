@@ -4,6 +4,7 @@ openlist:
 	nix develop --command OpenList server --data ./openlist_data
 
 init:
+	@cp -n server.example.yaml server.yaml 2>/dev/null || true
 	@cp -n pass.example.txt pass.txt 2>/dev/null || true
 	@cp -n routes.example.json routes.json 2>/dev/null || true
 

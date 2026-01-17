@@ -37,63 +37,24 @@ ffprobe -version
 
 ### 2. 配置 Server
 
-#### 2.1 OpenList 凭证
+#### 2.1 YAML 配置文件
 
-创建 `pass.txt`（从示例复制）：
-
-```bash
-cp pass.example.txt pass.txt
-```
-
-编辑 `pass.txt`：
-
-```ini
-user=admin
-pass=your_password
-base_url=http://127.0.0.1:15244
-```
-
-或使用环境变量：
+创建 `server.yaml`（从示例复制）：
 
 ```bash
+cp server.example.yaml server.yaml
+```
+
+编辑 `server.yaml`（包含 OpenList 凭证、routes、bootstrap tokens 等）：
+
+也可使用环境变量覆盖（优先级高于 YAML）：
+
+```bash
+export SERVER_CONFIG_FILE=server.yaml  # 可选；默认会自动探测 ./server.yaml|./server.yml
 export OPENLIST_BASE_URL=http://127.0.0.1:15244
 export OPENLIST_USER=admin
 export OPENLIST_PASS=your_password
 export OPENLIST_OTP=123456  # 可选，2FA
-```
-
-#### 2.2 路由配置
-
-创建 `routes.json`（从示例复制）：
-
-```bash
-cp routes.example.json routes.json
-```
-
-编辑 `routes.json`：
-
-```json
-[
-  {
-    "id": "photos",
-    "in_root": "/photos/raw",
-    "out_root": "/photos/compressed"
-  },
-  {
-    "id": "videos",
-    "in_root": "/videos/source",
-    "out_root": "/videos/output",
-    "profile": {
-      "video_encoder": "libx265",
-      "video_crf": 28
-    }
-  }
-]
-```
-
-或使用环境变量：
-
-```bash
 export ROUTES_JSON='[{"id":"default","in_root":"/input","out_root":"/output"}]'
 ```
 
@@ -120,10 +81,10 @@ export SERVER_PORT=8000     # 默认
 
 ```bash
 # 正常启动（后台扫描任务）
-uv run -m shrink_media_server.api
+uv run -m shrink_media_server.api --config server.yaml
 
 # 调试：只扫描一次生成任务
-uv run -m shrink_media_server.api --scan-once
+uv run -m shrink_media_server.api --config server.yaml --scan-once
 ```
 
 Server 启动后会：
@@ -195,8 +156,9 @@ make smoke
 
 运行时会产生以下文件（已加入 .gitignore）：
 
-- `pass.txt` - OpenList 凭证
-- `routes.json` - 路由配置
+- `server.yaml` - Server 配置（OpenList 凭证、routes 等）
+- `pass.txt` - OpenList 凭证（legacy fallback）
+- `routes.json` - 路由配置（legacy fallback）
 - `*.db` / `*.sqlite*` - 数据库文件
 - `.shrink_media_staging/` - 临时 staging 目录（在 out_root 下）
 

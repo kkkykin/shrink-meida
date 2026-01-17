@@ -1,0 +1,37 @@
+# shrink_media_server configuration (YAML)
+#
+# Usage:
+#   cp server.example.yaml server.yaml
+#
+# Environment variables override YAML values:
+#   - SERVER_CONFIG_FILE, SERVER_DB_URL, SERVER_HOST, SERVER_PORT
+#   - OPENLIST_BASE_URL, OPENLIST_USER, OPENLIST_PASS, OPENLIST_OTP
+#   - ROUTES_JSON
+#   - WORKER_TOKEN_*, WORKER_TOKENS
+
+db_url: sqlite:///shrink_media_server.db
+
+openlist:
+  base_url: http://127.0.0.1:15244
+  user: admin
+  pass: your_password
+  otp: null # optional
+
+server:
+  host: 127.0.0.1
+  port: 8000
+
+bootstrap_tokens:
+  - dev-token-001
+
+routes:
+  - id: photos
+    in_root: /photos/raw
+    out_root: /photos/compressed
+
+  - id: videos
+    in_root: /videos/source
+    out_root: /videos/output
+    profile:
+      video_encoder: libx265
+      video_crf: 28
