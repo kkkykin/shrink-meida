@@ -160,7 +160,8 @@ def build_video_cmd_single(
         if src_full_range:
             cmd += ["-vf", "scale=in_range=pc:out_range=pc"]
 
-        if container == "mp4":
+        # Only HEVC streams should be tagged as hvc1. Tagging H.264 as hvc1 can break muxing/playback.
+        if container == "mp4" and encoder in {"hevc_nvenc", "libx265"}:
             cmd += ["-tag:v", "hvc1"]
 
     # audio
