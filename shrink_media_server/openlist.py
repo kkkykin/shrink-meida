@@ -4,7 +4,7 @@ from __future__ import annotations
 import posixpath
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from shrink_media.openlist_client import OpenListClientSync
 
@@ -23,7 +23,29 @@ class OpenListManager:
         )
         self.base_url = base_url.rstrip("/")
 
-    def get_download_url(self, path: str) -> dict:
+    @staticmethod
+    def _rewrite_url_base(url: str, *, base_url: str) -> str:
+        base_url2 = (base_url or "").strip().rstrip("/")
+        if not base_url2:
+            return url
+
+        b = urlsplit(base_url2)
+        if not b.scheme or not b.netloc:
+            return url
+
+        u = urlsplit(url)
+        path = u.path or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+
+        base_path = b.path.rstrip("/")
+        if base_path and base_path != "/":
+            if path != base_path and not path.startswith(base_path + "/"):
+                path = base_path + path
+
+        return urlunsplit((b.scheme, b.netloc, path, u.query, u.fragment))
+
+    def get_download_url(self, path: str, *, base_url: str | None = None) -> dict:
         """
         Generate a download URL with sign for the given path.
         Returns: {url: str, expires_at: Optional[str]}
@@ -43,10 +65,11 @@ class OpenListManager:
             sep = "&" if "?" in url_path else "?"
             url_path += f"{sep}sign={sign}"
 
-        full_url = f"{self.base_url}{url_path}"
+        base = (base_url or self.base_url).rstrip("/")
+        full_url = f"{base}{url_path}"
         return {"url": full_url, "expires_at": None}
 
-    def get_direct_upload_info(self, dst_path: str, size: int) -> Optional[dict]:
+    def get_direct_upload_info(self, dst_path: str, size: int, *, base_url: str | None = None) -> Optional[dict]:
         """
         Get direct upload info from OpenList.
         Returns: {upload_url: str, method: str, chunk_size: int, headers: dict} or None
@@ -90,6 +113,12 @@ class OpenListManager:
 
             if not upload_url:
                 return None
+
+            if base_url is not None:
+                upload_url = self._rewrite_url_base(str(upload_url), base_url=base_url)
+            elif isinstance(upload_url, str) and upload_url.startswith("/"):
+                # Make sure workers don't treat it as a server-relative URL.
+                upload_url = f"{self.base_url}{upload_url}"
 
             return {
                 "url": upload_url,

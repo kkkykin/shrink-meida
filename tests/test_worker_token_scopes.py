@@ -34,7 +34,11 @@ class TokenScopeHarness(unittest.TestCase):
         )
         os.environ["WORKER_TOKENS_SCOPES_JSON"] = json.dumps(
             {
-                "token-r1-image": {"allow_routes": ["r1"], "allow_kinds": ["image"]},
+                "token-r1-image": {
+                    "allow_routes": ["r1"],
+                    "allow_kinds": ["image"],
+                    "base_url": "http://openlist.lan:15244",
+                },
                 "token-r2-any": {"allow_routes": ["r2"]},
                 "token-all": {},
             },
@@ -124,6 +128,33 @@ class TokenScopeHarness(unittest.TestCase):
 
 
 class TestWorkerTokenScopes(TokenScopeHarness):
+    def test_token_base_url_is_used_for_openlist_capabilities(self) -> None:
+        w_lan_id, w_lan_token = self.register_worker(bootstrap_token="token-r1-image", name="w-lan")
+        w_default_id, w_default_token = self.register_worker(bootstrap_token="token-all", name="w-default")
+
+        self.create_task(route_id="r1", src_path="/in1/a.jpg", src_rel="a.jpg")
+        self.create_task(route_id="r1", src_path="/in1/b.jpg", src_rel="b.jpg")
+
+        r = self.client.post(
+            "/v1/tasks/lease",
+            headers=self._auth_headers(w_lan_token),
+            json={"worker_id": w_lan_id, "n": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        tasks = r.json()["tasks"]
+        self.assertEqual(len(tasks), 1)
+        self.assertTrue(tasks[0]["download"]["url"].startswith("http://openlist.lan:15244/"))
+
+        r2 = self.client.post(
+            "/v1/tasks/lease",
+            headers=self._auth_headers(w_default_token),
+            json={"worker_id": w_default_id, "n": 1},
+        )
+        self.assertEqual(r2.status_code, 200, r2.text)
+        tasks2 = r2.json()["tasks"]
+        self.assertEqual(len(tasks2), 1)
+        self.assertTrue(tasks2[0]["download"]["url"].startswith("http://openlist.invalid/"))
+
     def test_lease_is_limited_by_route_id(self) -> None:
         w1_id, w1_token = self.register_worker(bootstrap_token="token-r1-image", name="w-r1")
         w2_id, w2_token = self.register_worker(bootstrap_token="token-all", name="w-all")

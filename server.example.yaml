@@ -29,6 +29,7 @@ bootstrap_tokens:
   - dev-token-001
   # 带 scope（可选）：限制该 token 注册出来的 worker 只能 lease 特定任务
   # - token: token-r1-image
+  #   base_url: http://10.0.0.10:15244 # 可选：下发给 worker 的 OpenList base_url（内网 worker 可避免走公网）
   #   allow_routes: [photos]   # route id 列表
   #   allow_kinds: [image]     # kind 列表：image/video/audio/comic/subtitle/other
 

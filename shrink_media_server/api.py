@@ -420,6 +420,7 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
             caps_json=json.dumps(req.caps, ensure_ascii=False, separators=(",", ":")),
             allow_kinds_json=allow_kinds_json,
             allow_routes_json=allow_routes_json,
+            openlist_base_url=(scope.openlist_base_url if scope is not None else None),
             last_seen_at=datetime.now(timezone.utc),
         )
         session.add(worker)
@@ -505,7 +506,11 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
             task.updated_at = now
 
             # Get download URL
-            download = openlist.get_download_url(task.src_path)
+            worker_openlist_base_url = getattr(worker, "openlist_base_url", None)
+            if worker_openlist_base_url:
+                download = openlist.get_download_url(task.src_path, base_url=worker_openlist_base_url)
+            else:
+                download = openlist.get_download_url(task.src_path)
 
             # Parse profile
             try:
@@ -617,7 +622,11 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
         openlist.ensure_dir(staging_dir)
 
         # Get direct upload info
-        upload_info = openlist.get_direct_upload_info(staging_path, req.out_size)
+        worker_openlist_base_url = getattr(worker, "openlist_base_url", None)
+        if worker_openlist_base_url:
+            upload_info = openlist.get_direct_upload_info(staging_path, req.out_size, base_url=worker_openlist_base_url)
+        else:
+            upload_info = openlist.get_direct_upload_info(staging_path, req.out_size)
         if upload_info:
             upload_info.setdefault("expires_at", None)
         else:

@@ -24,6 +24,9 @@ class Worker(Base):
     caps_json = Column(Text, nullable=False, default="{}")
     allow_kinds_json = Column(Text, nullable=True)
     allow_routes_json = Column(Text, nullable=True)
+    # Optional override for OpenList base URL used in worker capabilities
+    # (download `/d?...sign=...` and direct-upload `upload_url`).
+    openlist_base_url = Column(String(2048), nullable=True)
     last_seen_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
@@ -112,6 +115,8 @@ class Database:
                 conn.execute(text("ALTER TABLE workers ADD COLUMN allow_kinds_json TEXT"))
             if "allow_routes_json" not in col_names:
                 conn.execute(text("ALTER TABLE workers ADD COLUMN allow_routes_json TEXT"))
+            if "openlist_base_url" not in col_names:
+                conn.execute(text("ALTER TABLE workers ADD COLUMN openlist_base_url TEXT"))
 
     def get_session(self) -> Session:
         """Get a new database session."""

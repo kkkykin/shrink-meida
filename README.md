@@ -75,6 +75,12 @@ export WORKER_TOKENS=secret-token-abc,secret-token-xyz
 export WORKER_TOKENS_SCOPES_JSON='{"secret-token-abc":{"allow_routes":["photos"],"allow_kinds":["image"]}}'
 ```
 
+也可选：为某个 token 指定 `base_url`，用于下发给该 token 注册出来的 worker 的 OpenList 下载/直传 URL（内网 worker 可避免走公网）：
+
+```bash
+export WORKER_TOKENS_SCOPES_JSON='{"secret-token-abc":{"allow_routes":["photos"],"allow_kinds":["image"],"base_url":"http://10.0.0.10:15244"}}'
+```
+
 注意：scope 会写入 worker（注册时生成的 `WORKER_TOKEN`）。如果你修改了 scope，需要让 worker 重新注册（清空 `WORKER_TOKEN`，仅设置 `WORKER_BOOTSTRAP_TOKEN` 再启动）。
 
 #### 2.4 其他配置

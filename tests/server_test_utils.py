@@ -39,11 +39,13 @@ class FakeOpenListManager:
         self.files: dict[str, FakeRemoteInfo] = {}
         self.dirs: set[str] = set()
 
-    def get_download_url(self, path: str) -> dict:
+    def get_download_url(self, path: str, *, base_url: str | None = None) -> dict:
         p = path if path.startswith("/") else f"/{path}"
-        return {"url": f"{self.base_url}/d{p}", "expires_at": None}
+        base = (base_url or self.base_url).rstrip("/")
+        return {"url": f"{base}/d{p}", "expires_at": None}
 
-    def get_direct_upload_info(self, dst_path: str, size: int) -> Optional[dict]:
+    def get_direct_upload_info(self, dst_path: str, size: int, *, base_url: str | None = None) -> Optional[dict]:
+        _ = dst_path, size, base_url
         return None
 
     def ensure_dir(self, path: str):

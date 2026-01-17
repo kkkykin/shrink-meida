@@ -30,6 +30,9 @@ class BootstrapTokenScope:
 
     allow_kinds: Optional[list[str]] = None
     allow_routes: Optional[list[str]] = None
+    # Optional override for OpenList base URL used in worker capabilities
+    # (download `/d?...sign=...` and direct-upload `upload_url`).
+    openlist_base_url: Optional[str] = None
 
 
 @dataclass
@@ -377,10 +380,24 @@ class ServerConfig:
             allow_routes = ServerConfig._coerce_optional_str_list(
                 item.get("allow_routes", item.get("allow_route_ids", item.get("routes", item.get("route_ids", _MISSING))))
             )
+            base_url_raw = item.get("base_url", item.get("openlist_base_url", _MISSING))
+            if base_url_raw is _MISSING or base_url_raw is None:
+                openlist_base_url_str: Optional[str] = None
+            elif isinstance(base_url_raw, list):
+                raise TypeError(f"server.yaml: bootstrap_tokens[{token!r}]: base_url must be a string, not a list")
+            else:
+                openlist_base_url_str = str(base_url_raw).strip()
+                if not openlist_base_url_str:
+                    raise ValueError(f"server.yaml: bootstrap_tokens[{token!r}]: base_url is empty")
+                openlist_base_url_str = openlist_base_url_str.rstrip("/")
             ServerConfig._validate_task_kinds(allow_kinds, context=f"server.yaml: bootstrap_tokens[{token!r}]")
-            if allow_kinds is None and allow_routes is None:
+            if allow_kinds is None and allow_routes is None and openlist_base_url_str is None:
                 continue
-            scopes[token] = BootstrapTokenScope(allow_kinds=allow_kinds, allow_routes=allow_routes)
+            scopes[token] = BootstrapTokenScope(
+                allow_kinds=allow_kinds,
+                allow_routes=allow_routes,
+                openlist_base_url=openlist_base_url_str,
+            )
 
         return tokens, scopes
 
@@ -408,10 +425,24 @@ class ServerConfig:
                 allow_routes = ServerConfig._coerce_optional_str_list(
                     spec.get("allow_routes", spec.get("allow_route_ids", spec.get("routes", spec.get("route_ids", _MISSING))))
                 )
+                base_url_raw = spec.get("base_url", spec.get("openlist_base_url", _MISSING))
+                if base_url_raw is _MISSING or base_url_raw is None:
+                    openlist_base_url = None
+                elif isinstance(base_url_raw, list):
+                    raise TypeError(f"{context}[{t!r}]: base_url must be a string, not a list")
+                else:
+                    openlist_base_url = str(base_url_raw).strip()
+                    if not openlist_base_url:
+                        raise ValueError(f"{context}[{t!r}]: base_url is empty")
+                    openlist_base_url = openlist_base_url.rstrip("/")
                 ServerConfig._validate_task_kinds(allow_kinds, context=f"{context}[{t!r}]")
-                if allow_kinds is None and allow_routes is None:
+                if allow_kinds is None and allow_routes is None and openlist_base_url is None:
                     continue
-                scopes[t] = BootstrapTokenScope(allow_kinds=allow_kinds, allow_routes=allow_routes)
+                scopes[t] = BootstrapTokenScope(
+                    allow_kinds=allow_kinds,
+                    allow_routes=allow_routes,
+                    openlist_base_url=openlist_base_url,
+                )
             return scopes, tokens
 
         if isinstance(data, list):
