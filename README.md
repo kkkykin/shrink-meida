@@ -93,6 +93,10 @@ export SERVER_SCAN_INTERVAL_SECONDS=300  # 默认 300；设为 0 表示只启动
 # 正常启动（后台扫描任务）
 uv run -m shrink_media_server.api --config server.yaml
 
+# 可选：启动前将 failed/deadletter 统一重置回 queued（并重置 attempts=0）
+uv run -m shrink_media_server.api --config server.yaml --requeue-failed-on-startup
+# 如果 server 已经在运行，此命令只会更新 DB 并退出（不会启动第二个 server）。
+
 # 调试：只扫描一次生成任务
 uv run -m shrink_media_server.api --config server.yaml --scan-once
 ```

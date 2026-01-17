@@ -235,6 +235,37 @@ def _parse_json_str_list(v: str | None) -> Optional[list[str]]:
     return out
 
 
+def _requeue_tasks_by_status(
+    session: Session,
+    *,
+    status_in: list[str],
+    reset_attempts: bool,
+    limit: int,
+) -> int:
+    if not status_in:
+        return 0
+    now = datetime.now(timezone.utc)
+    tasks = session.query(Task).filter(Task.status.in_(status_in)).limit(limit).all()
+    updated = 0
+    for t in tasks:
+        if t.status == "finalized":
+            continue
+        t.status = "queued"
+        if reset_attempts:
+            t.attempts = 0
+        t.last_error = None
+        t.lease_worker_id = None
+        t.lease_expires_at = None
+        t.staging_path = None
+        t.final_path = None
+        t.action = None
+        t.out_size = None
+        t.updated_at = now
+        updated += 1
+    session.commit()
+    return updated
+
+
 def init_app(*, config_file: Path | None = None) -> FastAPI:
     """Initialize FastAPI application."""
     global config, db, openlist
@@ -1101,12 +1132,75 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
 def main():
     """Main entry point for the server."""
     import argparse
+    import socket
     import uvicorn
+    import httpx
 
     parser = argparse.ArgumentParser(description="shrink_media server")
     parser.add_argument("--config", type=Path, default=None, help="Server YAML config file path (env: SERVER_CONFIG_FILE)")
     parser.add_argument("--scan-once", action="store_true", help="Scan routes once to generate tasks and exit (for debugging)")
+    parser.add_argument(
+        "--requeue-failed-on-startup",
+        action="store_true",
+        help="Requeue tasks in failed/deadletter on startup (reset attempts to 0); if server is already running, only updates DB and exits.",
+    )
     args = parser.parse_args()
+
+    cfg = ServerConfig.load(config_file=args.config)
+
+    def _is_port_open(host: str, port: int) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=0.4):
+                return True
+        except OSError:
+            return False
+
+    def _is_server_running(host: str, port: int) -> bool:
+        candidates = []
+        if host and host != "0.0.0.0":
+            candidates.append(host)
+        candidates.extend(["127.0.0.1", "localhost"])
+        seen = set()
+        uniq = []
+        for h in candidates:
+            if h not in seen:
+                uniq.append(h)
+                seen.add(h)
+
+        for h in uniq:
+            try:
+                r = httpx.get(f"http://{h}:{port}/health", timeout=0.8)
+                if r.status_code == 200:
+                    return True
+            except Exception:
+                continue
+        for h in uniq:
+            if _is_port_open(h, port):
+                return True
+        return False
+
+    server_running = _is_server_running(cfg.host, cfg.port)
+
+    if args.requeue_failed_on_startup:
+        print("Requeueing failed/deadletter tasks (reset_attempts=1)...")
+        db0 = Database(cfg.db_url)
+        db0.create_tables()
+        session = db0.get_session()
+        try:
+            updated = _requeue_tasks_by_status(
+                session,
+                status_in=["failed", "deadletter"],
+                reset_attempts=True,
+                limit=1000000,
+            )
+        finally:
+            session.close()
+            db0.engine.dispose()
+        print(f"Requeued {updated} tasks")
+
+        if server_running and not args.scan_once:
+            print("Server already running; updated DB only (no restart).")
+            return
 
     app = init_app(config_file=args.config)
 

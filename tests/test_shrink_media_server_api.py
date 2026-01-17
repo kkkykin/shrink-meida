@@ -275,3 +275,29 @@ class TestShrinkMediaServerApi(ServerHarness):
         self.assertIsNotNone(t2b)
         self.assertEqual(t2b.status, "queued")
         self.assertEqual(int(t2b.attempts), 2)
+
+    def test_requeue_failed_on_startup_helper_resets_attempts(self) -> None:
+        task_deadletter = self.create_task(status="deadletter", attempts=3, max_attempts=3)
+        task_failed = self.create_task(status="failed", attempts=2, max_attempts=3, src_path="/in/b.mov", src_rel="b.mov", src_mtime_ns=2)
+
+        session = self.server_api.db.get_session()
+        try:
+            updated = self.server_api._requeue_tasks_by_status(
+                session,
+                status_in=["failed", "deadletter"],
+                reset_attempts=True,
+                limit=1000,
+            )
+        finally:
+            session.close()
+
+        self.assertEqual(updated, 2)
+        t1 = self.get_task(task_deadletter)
+        self.assertIsNotNone(t1)
+        self.assertEqual(t1.status, "queued")
+        self.assertEqual(int(t1.attempts), 0)
+
+        t2 = self.get_task(task_failed)
+        self.assertIsNotNone(t2)
+        self.assertEqual(t2.status, "queued")
+        self.assertEqual(int(t2.attempts), 0)
