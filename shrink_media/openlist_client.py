@@ -12,6 +12,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
@@ -139,6 +140,82 @@ class RemoteEntry:
     size: int
     mtime_ns: int
     sign: str = ""
+
+
+@dataclass
+class _FsObjectLite:
+    """
+    Minimal FsObject compatible with how shrink-media uses OpenList objects.
+
+    The upstream `openlist` Python client currently requires `path` in the API
+    response, but some OpenList servers omit it (both `/api/fs/get` and
+    `/api/fs/list`). We synthesize `path` to avoid hard failures while keeping
+    attribute access stable (`getattr(obj, "name")`, etc.).
+    """
+
+    path: str
+    name: str
+    size: int = 0
+    is_dir: bool = False
+    modified: Optional[datetime] = None
+    created: Optional[datetime] = None
+    sign: str = ""
+    thumb: str = ""
+    type: int = 0
+    hashinfo: Optional[str] = None
+    hash_info: Optional[dict] = None
+    provider: str = ""
+
+
+@dataclass
+class _FsListResultLite:
+    content: List[_FsObjectLite]
+    total: int = 0
+    readme: str = ""
+    header: str = ""
+    write: bool = False
+    provider: str = ""
+
+
+def _parse_openlist_dt(v: Any) -> Optional[datetime]:
+    if isinstance(v, datetime):
+        return v
+    if not isinstance(v, str) or not v:
+        return None
+    s = v
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _parse_openlist_fs_object(data: Dict[str, Any], *, requested_path: str, parent: Optional[str] = None) -> _FsObjectLite:
+    name = str(data.get("name") or "")
+    # OpenList server may omit `path`; synthesize it deterministically.
+    p = str(data.get("path") or "")
+    if not p:
+        if parent is not None and name:
+            p = posixpath.join(parent, name)
+        else:
+            p = requested_path
+    if not p.startswith("/"):
+        p = "/" + p
+    return _FsObjectLite(
+        path=p,
+        name=name,
+        size=int(data.get("size") or 0),
+        is_dir=bool(data.get("is_dir") or False),
+        modified=_parse_openlist_dt(data.get("modified")),
+        created=_parse_openlist_dt(data.get("created")),
+        sign=str(data.get("sign") or ""),
+        thumb=str(data.get("thumb") or ""),
+        type=int(data.get("type") or 0),
+        hashinfo=(data.get("hashinfo") if isinstance(data.get("hashinfo"), str) else None),
+        hash_info=(data.get("hash_info") if isinstance(data.get("hash_info"), dict) else None),
+        provider=str(data.get("provider") or ""),
+    )
 
 
 class OpenListClientSync:
@@ -328,28 +405,124 @@ class OpenListClientSync:
         return self._call_retry(lambda: self._list_recursive(root_path), op="list_recursive")
 
     def listdir(self, path: str, *, refresh: bool = False, per_page: int = 30, page: int = 1) -> Any:
-        assert self._client is not None
-        return self._call_retry(
-            lambda: self._client.fs.listdir(
-                path if path.startswith("/") else f"/{path}",
-                refresh=refresh,
-                page=page,
-                per_page=per_page,
-            ),
-            op="listdir",
-        )
+        p = path if path.startswith("/") else f"/{path}"
+
+        async def _do() -> _FsListResultLite:
+            return await self._fs_list(p, refresh=refresh, page=page, per_page=per_page)
+
+        return self._call_retry(_do, op="listdir")
 
     def info(self, path: str) -> Any:
+        p = path if path.startswith("/") else f"/{path}"
+
+        async def _do() -> _FsObjectLite:
+            return await self._fs_get(p)
+
+        return self._call_retry(_do, op="info")
+
+    async def _post_api(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         assert self._client is not None
-        return self._call_retry(lambda: self._client.fs.info(path if path.startswith("/") else f"/{path}"), op="info")
+        token = self._client.get_token()
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = token
+        r = await self._client.context.httpx_client.post(endpoint, json=payload, headers=headers)
+        if r.status_code == 401:
+            raise AuthenticationFailed("Unauthorized")
+        if r.status_code == 403:
+            try:
+                msg = str((r.json() or {}).get("message") or "Forbidden")
+            except Exception:
+                msg = "Forbidden"
+            raise AuthenticationFailed(msg)
+        if r.status_code != 200:
+            raise HttpStatusError(r.status_code, r.reason_phrase)
+        try:
+            j = r.json()
+        except Exception:
+            raise BadResponse("Invalid JSON response")
+        if not isinstance(j, dict):
+            raise BadResponse("Invalid JSON response")
+        code = j.get("code")
+        msg = str(j.get("message") or "")
+        if code == 401:
+            raise AuthenticationFailed(msg or "Unauthorized")
+        if code != 200:
+            raise BadResponse(msg or f"code={code}")
+        data = j.get("data")
+        if isinstance(data, dict):
+            return data
+        if data is None:
+            return {}
+        # Some OpenList endpoints may return non-dict `data` – keep best effort.
+        return {"value": data}
+
+    async def _fs_get(self, path: str, *, password: Optional[str] = None) -> _FsObjectLite:
+        p = path if path.startswith("/") else f"/{path}"
+        payload: Dict[str, Any] = {"path": p}
+        if password is not None:
+            payload["password"] = password
+        try:
+            data = await self._post_api("/api/fs/get", payload)
+        except BadResponse as e:
+            # OpenList uses code=500 + "object not found" for missing paths.
+            msg = str(e).lower()
+            if "not found" in msg or "object not found" in msg:
+                raise FileNotFoundError(p) from e
+            raise
+        if not data:
+            raise FileNotFoundError(p)
+        return _parse_openlist_fs_object(data, requested_path=p)
+
+    async def _fs_list(
+        self,
+        path: str,
+        *,
+        refresh: bool,
+        page: int,
+        per_page: int,
+        password: Optional[str] = None,
+    ) -> _FsListResultLite:
+        p = path if path.startswith("/") else f"/{path}"
+        payload: Dict[str, Any] = {
+            "path": p,
+            "refresh": bool(refresh),
+            "page": int(page),
+            "per_page": int(per_page),
+        }
+        if password is not None:
+            payload["password"] = password
+        try:
+            data = await self._post_api("/api/fs/list", payload)
+        except BadResponse as e:
+            msg = str(e).lower()
+            if "not found" in msg or "object not found" in msg:
+                raise FileNotFoundError(p) from e
+            raise
+
+        content_raw = data.get("content", [])
+        content: List[_FsObjectLite] = []
+        if isinstance(content_raw, list):
+            for item in content_raw:
+                if not isinstance(item, dict):
+                    continue
+                content.append(_parse_openlist_fs_object(item, requested_path=p, parent=p))
+
+        return _FsListResultLite(
+            content=content,
+            total=int(data.get("total") or 0),
+            readme=str(data.get("readme") or ""),
+            header=str(data.get("header") or ""),
+            write=bool(data.get("write") or False),
+            provider=str(data.get("provider") or ""),
+        )
 
     async def _list_recursive(self, root_path: str) -> List[RemoteEntry]:
         root_norm = root_path.rstrip("/") or "/"
         entries: List[RemoteEntry] = []
 
         try:
-            assert self._client is not None
-            root_info = await self._client.fs.info(root_norm)
+            root_info = await self._fs_get(root_norm)
         except Exception as e:
             raise RuntimeError(f"remote info failed: {e}")
 
@@ -367,11 +540,10 @@ class OpenListClientSync:
             return entries
 
         async def walk(cur: str) -> None:
-            assert self._client is not None
             page = 1
             got = 0
             while True:
-                res = await self._client.fs.listdir(cur, refresh=True, per_page=100, page=page)
+                res = await self._fs_list(cur, refresh=True, per_page=100, page=page)
                 for obj in res.content:
                     child_path = posixpath.join(cur, obj.name)
                     if obj.is_dir:
@@ -476,32 +648,8 @@ class OpenListClientSync:
         # OpenList 的 /d 下载接口在部分场景下需要 sign，否则会返回 401（如 expire missing）。
         # 同时，OpenList 的 fs.info 在"对象不存在"时可能不会抛异常，而是返回"空对象"（取决于 openlist 客户端版本）。
         # 这里统一用 fs.info 的返回来判断存在性，并拿到 sign，避免依赖下载时报错来区分不存在。
-        try:
-            info = await self._client.fs.info(p)
-        except Exception as e:
-            msg = str(e).lower()
-            if "not found" in msg or "object not found" in msg:
-                raise FileNotFoundError(p)
-            raise
-
-        if info is None:
-            raise FileNotFoundError(p)
-        # 兼容"空对象"表示不存在：data=null 时常见字段可能为空/None。
-        name = getattr(info, "name", None)
-        path = getattr(info, "path", None)
-        sign0 = getattr(info, "sign", None)
-        size0 = getattr(info, "size", None)
-        modified0 = getattr(info, "modified", None)
-        if (
-            name in (None, "")
-            and path in (None, "")
-            and sign0 in (None, "")
-            and (size0 in (None, 0))
-            and modified0 is None
-        ):
-            raise FileNotFoundError(p)
-
-        sign = str(sign0 or "")
+        info = await self._fs_get(p)
+        sign = str(getattr(info, "sign", "") or "")
         url_path = f"/d{quote(p, safe='/')}"
         if sign:
             sep = "&" if "?" in url_path else "?"
