@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
-from .config import ServerConfig
+from .config import Route, ServerConfig
 from .models import Attempt, Database, Task, Worker
 from .openlist import OpenListManager
 from shrink_media.classify import classify as classify_media
@@ -280,17 +280,37 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
         otp_key=config.openlist_otp,
     )
 
-    def _scan_once(*, reason: str) -> None:
+    def _effective_route_scan_interval_seconds(route: Route) -> int:
+        if route.scan_interval_seconds is None:
+            return max(0, int(config.scan_interval_seconds or 0))
+        return max(0, int(route.scan_interval_seconds or 0))
+
+    def _scan_once(*, reason: str, routes: list[Route] | None = None) -> None:
         if not config.routes:
             logger.info("Route scan skipped: no routes configured", extra={"reason": reason})
             return
 
-        from .scanner import scan_all_routes
+        from .scanner import process_copy_tasks, scan_all_routes, scan_route
 
         started = time.time()
         session = db.get_session()
         try:
-            summary = scan_all_routes(config, openlist, session)
+            if routes is None:
+                summary = scan_all_routes(config, openlist, session)
+            else:
+                summary = {}
+                for route in routes:
+                    created, skipped = scan_route(
+                        session=session,
+                        openlist=openlist,
+                        route_id=route.id,
+                        in_root=route.in_root,
+                        profile=route.profile,
+                    )
+                    summary[route.id] = {"created": created, "skipped": skipped}
+
+                # Execute copy-mode tasks on server (no worker involved).
+                process_copy_tasks(config=config, openlist=openlist, session=session)
         except Exception:
             logger.exception("Route scan failed", extra={"reason": reason})
             return
@@ -305,6 +325,7 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
             extra={
                 "reason": reason,
                 "routes": len(summary),
+                "route_ids": sorted(summary.keys()),
                 "created": created_total,
                 "skipped": skipped_total,
                 "elapsed_s": round(elapsed_s, 3),
@@ -320,21 +341,47 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
             if config.scan_on_startup:
                 _scan_once(reason="startup")
 
-            interval = int(config.scan_interval_seconds or 0)
-            if interval <= 0:
+            route_intervals: dict[str, int] = {}
+            route_by_id: dict[str, Route] = {}
+            for r in config.routes:
+                route_by_id[r.id] = r
+                interval = _effective_route_scan_interval_seconds(r)
+                if interval > 0:
+                    route_intervals[r.id] = interval
+
+            if not route_intervals:
                 return
 
-            while not stop_event.wait(timeout=interval):
-                _scan_once(reason="interval")
+            route_ids = sorted(route_intervals.keys())
+            now = time.monotonic()
+            next_run: dict[str, float] = {rid: now + float(route_intervals[rid]) for rid in route_ids}
 
-        if config.scan_on_startup or int(config.scan_interval_seconds or 0) > 0:
+            while True:
+                now = time.monotonic()
+                next_due = min(next_run.values())
+                timeout = max(0.0, next_due - now)
+                if stop_event.wait(timeout=timeout):
+                    return
+
+                now = time.monotonic()
+                due_route_ids = [rid for rid in route_ids if now >= next_run[rid]]
+                if due_route_ids:
+                    due_routes = [route_by_id[rid] for rid in due_route_ids if rid in route_by_id]
+                    _scan_once(reason="interval", routes=due_routes)
+                    now2 = time.monotonic()
+                    for rid in due_route_ids:
+                        next_run[rid] = now2 + float(route_intervals[rid])
+
+        periodic_routes = sum(1 for r in config.routes if _effective_route_scan_interval_seconds(r) > 0)
+        if config.scan_on_startup or periodic_routes > 0:
             scan_thread = threading.Thread(target=_loop, name="shrink_media_scan_loop", daemon=True)
             scan_thread.start()
             logger.info(
                 "Background scan enabled",
                 extra={
                     "scan_on_startup": bool(config.scan_on_startup),
-                    "scan_interval_seconds": int(config.scan_interval_seconds or 0),
+                    "default_scan_interval_seconds": int(config.scan_interval_seconds or 0),
+                    "periodic_routes": int(periodic_routes),
                 },
             )
 

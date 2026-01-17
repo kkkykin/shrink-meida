@@ -22,6 +22,9 @@ class Route:
     id: str
     in_root: str
     out_root: str
+    # Optional per-route scan interval override (seconds). When None, fall back to server.scan_interval_seconds.
+    # 0 disables periodic scan for this route.
+    scan_interval_seconds: Optional[int] = None
     # compress: worker downloads -> transcodes/copies -> uploads staging -> server finalizes
     # copy: server uses OpenList remote copy (no download/upload)
     mode: str = "compress"
@@ -513,10 +516,18 @@ class ServerConfig:
             if mode not in _ALLOWED_ROUTE_MODES:
                 allowed = ", ".join(sorted(_ALLOWED_ROUTE_MODES))
                 raise ValueError(f"routes: invalid mode {mode!r} (allowed: {allowed})")
+
+            scan_interval_raw = item.get("scan_interval_seconds", _MISSING)
+            if scan_interval_raw is _MISSING or scan_interval_raw is None:
+                scan_interval_seconds: Optional[int] = None
+            else:
+                scan_interval_seconds = max(0, int(ServerConfig._coerce_int(scan_interval_raw)))
+
             routes.append(Route(
                 id=item["id"],
                 in_root=item["in_root"],
                 out_root=item["out_root"],
+                scan_interval_seconds=scan_interval_seconds,
                 mode=mode,
                 profile=item.get("profile"),
             ))

@@ -97,6 +97,8 @@ export SERVER_SCAN_ON_STARTUP=1          # 默认 1
 export SERVER_SCAN_INTERVAL_SECONDS=300  # 默认 300；设为 0 表示只启动时扫描一次
 ```
 
+也可对单个 route 设置 `scan_interval_seconds` 覆盖默认扫描间隔；不设置则回退到 `SERVER_SCAN_INTERVAL_SECONDS`。注意：`scan_interval_seconds` 仅影响周期扫描，启动时扫描仍由 `SERVER_SCAN_ON_STARTUP` 对所有 routes 统一控制。
+
 ### 3. 启动 Server
 
 ```bash

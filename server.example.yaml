@@ -22,7 +22,7 @@ server:
   host: 127.0.0.1
   port: 8000
   scan_on_startup: true
-  scan_interval_seconds: 300 # 0=disable periodic scan
+  scan_interval_seconds: 300 # 0=disable periodic scan by default (routes can override)
 
 bootstrap_tokens:
   # 无 scope：可处理所有 route + 所有 kind（image/video/audio/comic/subtitle/other）
@@ -37,6 +37,9 @@ routes:
   - id: photos
     in_root: /photos/raw
     out_root: /photos/compressed
+    # Optional per-route scan interval override (seconds).
+    # When omitted, falls back to server.scan_interval_seconds.
+    # scan_interval_seconds: 60
     # mode: compress|copy (default: compress)
     # - compress: worker 下载/转码/上传，server finalize
     # - copy: server 直接调用 OpenList 远端 copy（不下载/不上传）
@@ -45,6 +48,7 @@ routes:
   - id: videos
     in_root: /videos/source
     out_root: /videos/output
+    # scan_interval_seconds: 600
     profile:
       video_encoder: libx265
       video_crf: 28
