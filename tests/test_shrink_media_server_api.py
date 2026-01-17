@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from server_test_utils import FakeRemoteInfo, ServerHarness
 
@@ -89,6 +91,52 @@ class TestShrinkMediaServerApi(ServerHarness):
             json={"worker_id": worker_id, "out_size": 0, "out_ext": "", "action": "skip"},
         )
         self.assertEqual(r.status_code, 400)
+
+    def test_upload_proxy_accepts_content_range(self) -> None:
+        worker_id, worker_token = self.register_worker()
+        task_id = self.create_task(src_path="/in/dir/a.mov", src_rel="dir/a.mov")
+
+        r = self.client.post(
+            "/v1/tasks/lease",
+            headers=self._auth_headers(worker_token),
+            json={"worker_id": worker_id, "n": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+        r = self.client.post(
+            f"/v1/tasks/{task_id}/upload_intent",
+            headers=self._auth_headers(worker_token),
+            json={"worker_id": worker_id, "out_size": 6, "out_ext": ".mp4", "action": "ok"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        staging_path = r.json()["staging_path"]
+
+        r1 = self.client.put(
+            f"/v1/tasks/{task_id}/upload_proxy",
+            headers={**self._auth_headers(worker_token), "Content-Range": "bytes 0-3/6"},
+            content=b"abcd",
+        )
+        self.assertEqual(r1.status_code, 200, r1.text)
+        self.assertTrue(r1.json()["ok"])
+        self.assertEqual(int(r1.json()["received"]), 4)
+        self.assertEqual(int(r1.json()["total"]), 6)
+
+        r2 = self.client.put(
+            f"/v1/tasks/{task_id}/upload_proxy",
+            headers={**self._auth_headers(worker_token), "Content-Range": "bytes 4-5/6"},
+            content=b"ef",
+        )
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertTrue(r2.json()["ok"])
+        self.assertEqual(r2.json()["staging_path"], staging_path)
+        self.assertEqual(int(r2.json()["size"]), 6)
+
+        info = self.openlist.files.get(staging_path)
+        self.assertIsNotNone(info)
+        self.assertEqual(int(info.size), 6)
+
+        tmp_dir = Path(tempfile.gettempdir()) / "shrink_media_server_upload_proxy" / task_id
+        self.assertFalse(tmp_dir.exists())
 
     def test_complete_is_idempotent(self) -> None:
         worker_id, worker_token = self.register_worker()

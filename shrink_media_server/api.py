@@ -665,7 +665,7 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
 
         content_range = (request.headers.get("content-range") or "").strip()
         if content_range:
-            m = re.match(r"^bytes (\\d+)-(\\d+)/(\\d+)$", content_range)
+            m = re.match(r"^bytes (\d+)-(\d+)/(\d+)$", content_range)
             if not m:
                 raise HTTPException(status_code=400, detail="Invalid Content-Range header")
             start, end, total = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
