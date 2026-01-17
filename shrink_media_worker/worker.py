@@ -86,7 +86,12 @@ class Worker:
                 resp.raise_for_status()
                 data = resp.json()
                 self.worker_id = int(data["worker_id"])
-                print(f"Using existing worker token (worker_id={self.worker_id})")
+                allow_kinds = data.get("allow_kinds")
+                allow_routes = data.get("allow_routes")
+                scope_hint = ""
+                if allow_kinds is not None or allow_routes is not None:
+                    scope_hint = f", allow_kinds={allow_kinds}, allow_routes={allow_routes}"
+                print(f"Using existing worker token (worker_id={self.worker_id}{scope_hint})")
                 return
             except Exception:
                 print("Existing token invalid, re-registering...")
@@ -106,6 +111,10 @@ class Worker:
         self.worker_token = data["worker_token"]
         print(f"Registered as worker {self.worker_id}")
         print(f"Worker token: {self.worker_token}")
+        allow_kinds = data.get("allow_kinds")
+        allow_routes = data.get("allow_routes")
+        if allow_kinds is not None or allow_routes is not None:
+            print(f"Worker scope: allow_kinds={allow_kinds}, allow_routes={allow_routes}")
         print("Save this token to WORKER_TOKEN env var for future runs")
 
     def lease_tasks(self) -> list[dict]:
@@ -307,13 +316,20 @@ class Worker:
                     upload_headers.setdefault("Authorization", self._auth_headers()["Authorization"])
 
                 upload_start = time.time()
-                upload_file_chunked(
-                    upload_url,
-                    result.out_local,
-                    method=upload_info.get("method", "PUT"),
-                    chunk_size=upload_info.get("chunk_size", 5 * 1024 * 1024),
-                    headers=upload_headers,
-                )
+                try:
+                    upload_file_chunked(
+                        upload_url,
+                        result.out_local,
+                        method=upload_info.get("method", "PUT"),
+                        chunk_size=upload_info.get("chunk_size", 5 * 1024 * 1024),
+                        headers=upload_headers,
+                    )
+                except httpx.HTTPStatusError as e:
+                    body = (e.response.text or "").strip()
+                    if body:
+                        body = body[:2000]
+                        raise RuntimeError(f"{e}; response={body}") from e
+                    raise
                 upload_time = time.time() - upload_start
 
                 src_size = task["src_size"]

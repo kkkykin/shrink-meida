@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from .config import ServerConfig
 from .models import Attempt, Database, Task, Worker
 from .openlist import OpenListManager
+from shrink_media.classify import classify as classify_media
 from shrink_media.workitem import build_suffixed_target_name, normalize_ext
 
 logger = logging.getLogger(__name__)
@@ -40,12 +41,16 @@ class RegisterRequest(BaseModel):
 class RegisterResponse(BaseModel):
     worker_id: int
     worker_token: str
+    allow_kinds: Optional[list[str]] = None
+    allow_routes: Optional[list[str]] = None
 
 
 class WorkerMeResponse(BaseModel):
     worker_id: int
     name: str
     caps: dict = Field(default_factory=dict)
+    allow_kinds: Optional[list[str]] = None
+    allow_routes: Optional[list[str]] = None
 
 
 class LeaseRequest(BaseModel):
@@ -213,6 +218,23 @@ def _is_task_staging_path(*, path: str, out_root: str, task_id: str) -> bool:
         return False
 
 
+def _parse_json_str_list(v: str | None) -> Optional[list[str]]:
+    if v is None:
+        return None
+    try:
+        data = json.loads(v)
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    out: list[str] = []
+    for item in data:
+        s = str(item).strip()
+        if s:
+            out.append(s)
+    return out
+
+
 def init_app(*, config_file: Path | None = None) -> FastAPI:
     """Initialize FastAPI application."""
     global config, db, openlist
@@ -352,17 +374,33 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
         token_hash = hashlib.sha256(worker_token.encode()).hexdigest()
 
         # Create worker
+        scope = config.bootstrap_token_scopes.get(token)
+        allow_kinds_json: str | None = None
+        allow_routes_json: str | None = None
+        if scope is not None:
+            if scope.allow_kinds is not None:
+                allow_kinds_json = json.dumps(scope.allow_kinds, ensure_ascii=False, separators=(",", ":"))
+            if scope.allow_routes is not None:
+                allow_routes_json = json.dumps(scope.allow_routes, ensure_ascii=False, separators=(",", ":"))
+
         worker = Worker(
             name=req.name,
             token_hash=token_hash,
             caps_json=json.dumps(req.caps, ensure_ascii=False, separators=(",", ":")),
+            allow_kinds_json=allow_kinds_json,
+            allow_routes_json=allow_routes_json,
             last_seen_at=datetime.now(timezone.utc),
         )
         session.add(worker)
         session.commit()
         session.refresh(worker)
 
-        return RegisterResponse(worker_id=worker.id, worker_token=worker_token)
+        return RegisterResponse(
+            worker_id=worker.id,
+            worker_token=worker_token,
+            allow_kinds=scope.allow_kinds if scope is not None else None,
+            allow_routes=scope.allow_routes if scope is not None else None,
+        )
 
     @app.get("/v1/workers/me", response_model=WorkerMeResponse)
     def worker_me(worker: Worker = Depends(authenticate_worker)) -> WorkerMeResponse:
@@ -371,7 +409,13 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
             caps = json.loads(worker.caps_json) if worker.caps_json else {}
         except Exception:
             caps = {}
-        return WorkerMeResponse(worker_id=worker.id, name=worker.name, caps=caps)
+        return WorkerMeResponse(
+            worker_id=worker.id,
+            name=worker.name,
+            caps=caps,
+            allow_kinds=_parse_json_str_list(getattr(worker, "allow_kinds_json", None)),
+            allow_routes=_parse_json_str_list(getattr(worker, "allow_routes_json", None)),
+        )
 
     @app.post("/v1/tasks/lease", response_model=LeaseResponse)
     def lease_tasks(
@@ -383,24 +427,42 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
         if req.worker_id != worker.id:
             raise HTTPException(status_code=403, detail="Worker mismatch")
 
+        allow_kinds = _parse_json_str_list(getattr(worker, "allow_kinds_json", None))
+        allow_routes = _parse_json_str_list(getattr(worker, "allow_routes_json", None))
+        if allow_kinds is not None and not allow_kinds:
+            return LeaseResponse(tasks=[])
+        if allow_routes is not None and not allow_routes:
+            return LeaseResponse(tasks=[])
+        allow_kinds_set = set(allow_kinds) if allow_kinds is not None else None
+
         # Find available tasks (queued or expired leases)
         now = datetime.now(timezone.utc)
-        tasks = (
+        q = (
             session.query(Task)
             .filter(
                 (Task.status == "queued")
                 | ((Task.status == "leased") & (Task.lease_expires_at < now)),
                 Task.attempts < Task.max_attempts,
             )
-            .limit(req.n)
-            .all()
         )
+        if allow_routes is not None:
+            q = q.filter(Task.route_id.in_(allow_routes))
+
+        # NOTE: kind filtering is done in Python (cheap, extension-based) to avoid DB schema coupling.
+        max_scan = min(5000, max(int(req.n) * 50, 200))
+        tasks = q.order_by(Task.updated_at.asc()).limit(max_scan).all()
 
         # Lease tasks
         lease_expires_at = now + timedelta(minutes=10)
         leased_tasks = []
 
         for task in tasks:
+            if allow_kinds_set is not None:
+                kind = classify_media(Path(task.src_rel), None).kind
+                if kind not in allow_kinds_set:
+                    continue
+            if len(leased_tasks) >= req.n:
+                break
             task.status = "leased"
             task.lease_worker_id = worker.id
             task.lease_expires_at = lease_expires_at

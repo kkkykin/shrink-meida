@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -11,6 +11,8 @@ import yaml
 
 
 _MISSING = object()
+
+_ALLOWED_TASK_KINDS = {"image", "video", "audio", "comic", "subtitle", "other"}
 
 
 @dataclass
@@ -20,6 +22,14 @@ class Route:
     in_root: str
     out_root: str
     profile: Optional[dict] = None
+
+
+@dataclass(frozen=True)
+class BootstrapTokenScope:
+    """Bootstrap token scope for workers (enforced when leasing tasks)."""
+
+    allow_kinds: Optional[list[str]] = None
+    allow_routes: Optional[list[str]] = None
 
 
 @dataclass
@@ -46,6 +56,7 @@ class ServerConfig:
     port: int
     scan_on_startup: bool
     scan_interval_seconds: int
+    bootstrap_token_scopes: dict[str, BootstrapTokenScope] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> ServerConfig:
@@ -147,29 +158,71 @@ class ServerConfig:
                 else:
                     routes = []
 
-        # Worker tokens: env(WORKER_TOKEN_*/WORKER_TOKENS) > yaml(bootstrap_tokens) > default
+        # Worker tokens: env(WORKER_TOKEN_*/WORKER_TOKENS[/WORKER_TOKENS_SCOPES_JSON]) > yaml(bootstrap_tokens) > default
         bootstrap_tokens: list[str] = []
+        bootstrap_token_scopes: dict[str, BootstrapTokenScope] = {}
+
+        env_scopes_key: str | None = None
+        if "WORKER_TOKENS_SCOPES_JSON" in os.environ:
+            env_scopes_key = "WORKER_TOKENS_SCOPES_JSON"
+        elif "WORKER_TOKEN_SCOPES_JSON" in os.environ:
+            # Backward-compat alias (do not start new configs with WORKER_TOKEN_* to avoid collisions).
+            env_scopes_key = "WORKER_TOKEN_SCOPES_JSON"
+        env_scopes_present = env_scopes_key is not None
+        scopes_from_env: dict[str, BootstrapTokenScope] = {}
+        tokens_from_scopes: list[str] = []
+        if env_scopes_present:
+            scopes_from_env, tokens_from_scopes = cls._parse_token_scopes_json(
+                os.environ.get(env_scopes_key) or "",
+                context=env_scopes_key,
+            )
+
+        env_tokens_star: list[str] = []
         for k, v in sorted(os.environ.items(), key=lambda kv: kv[0]):
             if not k.startswith("WORKER_TOKEN_"):
                 continue
+            if k in {"WORKER_TOKEN_SCOPES_JSON"}:
+                continue
             t = (v or "").strip()
             if t:
-                bootstrap_tokens.append(t)
-        if not bootstrap_tokens:
-            worker_tokens_str = os.environ.get("WORKER_TOKENS")
-            if worker_tokens_str is not None:
-                bootstrap_tokens = [t.strip() for t in worker_tokens_str.split(",") if t.strip()]
+                env_tokens_star.append(t)
+
+        env_tokens_csv_present = "WORKER_TOKENS" in os.environ
+        env_tokens_csv: list[str] = []
+        if not env_tokens_star and env_tokens_csv_present:
+            env_tokens_csv = [t.strip() for t in (os.environ.get("WORKER_TOKENS") or "").split(",") if t.strip()]
+
+        env_explicit = bool(env_tokens_star) or env_tokens_csv_present or env_scopes_present
+        if env_explicit:
+            if env_tokens_star:
+                bootstrap_tokens = env_tokens_star
+                bootstrap_token_scopes = {t: scopes_from_env[t] for t in bootstrap_tokens if t in scopes_from_env}
+            elif env_tokens_csv_present:
+                bootstrap_tokens = env_tokens_csv
+                bootstrap_token_scopes = {t: scopes_from_env[t] for t in bootstrap_tokens if t in scopes_from_env}
             else:
-                yaml_tokens = cls._pick_yaml(config_yaml, ("bootstrap_tokens",), ("worker", "bootstrap_tokens"))
-                if yaml_tokens is not _MISSING:
-                    if isinstance(yaml_tokens, list):
-                        bootstrap_tokens = [str(t) for t in yaml_tokens]
-                    elif isinstance(yaml_tokens, str):
-                        bootstrap_tokens = [t.strip() for t in yaml_tokens.split(",") if t.strip()]
-                    else:
-                        raise TypeError("server.yaml: bootstrap_tokens must be a list[str] or comma-separated string")
-                else:
-                    bootstrap_tokens = ["dev-token-001"]
+                # scopes-only mode
+                bootstrap_tokens = tokens_from_scopes
+                bootstrap_token_scopes = scopes_from_env
+        else:
+            yaml_tokens = cls._pick_yaml(config_yaml, ("bootstrap_tokens",), ("worker", "bootstrap_tokens"))
+            if yaml_tokens is not _MISSING:
+                tokens_from_yaml, scopes_from_yaml = cls._parse_bootstrap_tokens_yaml(yaml_tokens)
+                bootstrap_tokens = tokens_from_yaml
+                bootstrap_token_scopes = scopes_from_yaml
+            else:
+                bootstrap_tokens = ["dev-token-001"]
+
+        # De-dup, preserve order
+        seen_tokens: set[str] = set()
+        deduped: list[str] = []
+        for t in bootstrap_tokens:
+            t2 = (t or "").strip()
+            if not t2 or t2 in seen_tokens:
+                continue
+            seen_tokens.add(t2)
+            deduped.append(t2)
+        bootstrap_tokens = deduped
 
         # Server settings: env > yaml > defaults
         host = os.environ.get("SERVER_HOST")
@@ -207,6 +260,7 @@ class ServerConfig:
             openlist_otp=openlist_otp,
             routes=routes,
             bootstrap_tokens=bootstrap_tokens,
+            bootstrap_token_scopes=bootstrap_token_scopes,
             host=host,
             port=port,
             scan_on_startup=scan_on_startup,
@@ -264,6 +318,107 @@ class ServerConfig:
             if s in {"0", "false", "no", "n", "off", ""}:
                 return False
         raise TypeError(f"expected bool, got {type(v).__name__}")
+
+    @staticmethod
+    def _coerce_optional_str_list(v: object) -> Optional[list[str]]:
+        if v is None or v is _MISSING:
+            return None
+        if isinstance(v, list):
+            out: list[str] = []
+            for item in v:
+                s = str(item).strip()
+                if s:
+                    out.append(s)
+            return out
+        if isinstance(v, str):
+            parts = [p.strip() for p in v.split(",")]
+            return [p for p in parts if p]
+        raise TypeError(f"expected list[str] or comma-separated string, got {type(v).__name__}")
+
+    @staticmethod
+    def _validate_task_kinds(kinds: Optional[list[str]], *, context: str) -> None:
+        if kinds is None:
+            return
+        bad = [k for k in kinds if k not in _ALLOWED_TASK_KINDS]
+        if bad:
+            bad_s = ", ".join(sorted(set(bad)))
+            allowed_s = ", ".join(sorted(_ALLOWED_TASK_KINDS))
+            raise ValueError(f"{context}: invalid allow_kinds: {bad_s} (allowed: {allowed_s})")
+
+    @staticmethod
+    def _parse_bootstrap_tokens_yaml(v: object) -> tuple[list[str], dict[str, BootstrapTokenScope]]:
+        if isinstance(v, str):
+            tokens = [t.strip() for t in v.split(",") if t.strip()]
+            return tokens, {}
+        if not isinstance(v, list):
+            raise TypeError("server.yaml: bootstrap_tokens must be a list or comma-separated string")
+
+        tokens: list[str] = []
+        scopes: dict[str, BootstrapTokenScope] = {}
+
+        for item in v:
+            if isinstance(item, str):
+                t = item.strip()
+                if t:
+                    tokens.append(t)
+                continue
+            if not isinstance(item, dict):
+                raise TypeError("server.yaml: bootstrap_tokens items must be str or object")
+
+            token_raw = item.get("token")
+            if token_raw is None:
+                raise TypeError("server.yaml: bootstrap_tokens object missing 'token'")
+            token = str(token_raw).strip()
+            if not token:
+                raise TypeError("server.yaml: bootstrap_tokens object has empty 'token'")
+            tokens.append(token)
+
+            allow_kinds = ServerConfig._coerce_optional_str_list(item.get("allow_kinds", _MISSING))
+            allow_routes = ServerConfig._coerce_optional_str_list(
+                item.get("allow_routes", item.get("allow_route_ids", item.get("routes", item.get("route_ids", _MISSING))))
+            )
+            ServerConfig._validate_task_kinds(allow_kinds, context=f"server.yaml: bootstrap_tokens[{token!r}]")
+            if allow_kinds is None and allow_routes is None:
+                continue
+            scopes[token] = BootstrapTokenScope(allow_kinds=allow_kinds, allow_routes=allow_routes)
+
+        return tokens, scopes
+
+    @staticmethod
+    def _parse_token_scopes_json(raw: str, *, context: str) -> tuple[dict[str, BootstrapTokenScope], list[str]]:
+        raw2 = (raw or "").strip()
+        if not raw2:
+            return {}, []
+        data = json.loads(raw2)
+
+        scopes: dict[str, BootstrapTokenScope] = {}
+        tokens: list[str] = []
+
+        if isinstance(data, dict):
+            for token, spec in data.items():
+                t = str(token).strip()
+                if not t:
+                    continue
+                tokens.append(t)
+                if spec is None:
+                    continue
+                if not isinstance(spec, dict):
+                    raise TypeError(f"{context}: token spec must be an object")
+                allow_kinds = ServerConfig._coerce_optional_str_list(spec.get("allow_kinds", _MISSING))
+                allow_routes = ServerConfig._coerce_optional_str_list(
+                    spec.get("allow_routes", spec.get("allow_route_ids", spec.get("routes", spec.get("route_ids", _MISSING))))
+                )
+                ServerConfig._validate_task_kinds(allow_kinds, context=f"{context}[{t!r}]")
+                if allow_kinds is None and allow_routes is None:
+                    continue
+                scopes[t] = BootstrapTokenScope(allow_kinds=allow_kinds, allow_routes=allow_routes)
+            return scopes, tokens
+
+        if isinstance(data, list):
+            tokens, scopes = ServerConfig._parse_bootstrap_tokens_yaml(data)
+            return scopes, tokens
+
+        raise TypeError(f"{context}: expected object or list")
 
     @staticmethod
     def _yaml_get(data: dict[str, Any], path: tuple[str, ...]) -> object:

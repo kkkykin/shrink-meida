@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, text
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -22,6 +22,8 @@ class Worker(Base):
     name = Column(String(255), nullable=False)
     token_hash = Column(String(64), nullable=False, unique=True)
     caps_json = Column(Text, nullable=False, default="{}")
+    allow_kinds_json = Column(Text, nullable=True)
+    allow_routes_json = Column(Text, nullable=True)
     last_seen_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
@@ -97,6 +99,19 @@ class Database:
     def create_tables(self):
         """Create all tables if they don't exist."""
         Base.metadata.create_all(self.engine)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Best-effort migrations for SQLite (add new columns if missing)."""
+        if self.engine.dialect.name != "sqlite":
+            return
+        with self.engine.begin() as conn:
+            cols = conn.execute(text("PRAGMA table_info(workers)")).fetchall()
+            col_names = {str(r[1]) for r in cols}  # (cid, name, type, notnull, dflt_value, pk)
+            if "allow_kinds_json" not in col_names:
+                conn.execute(text("ALTER TABLE workers ADD COLUMN allow_kinds_json TEXT"))
+            if "allow_routes_json" not in col_names:
+                conn.execute(text("ALTER TABLE workers ADD COLUMN allow_routes_json TEXT"))
 
     def get_session(self) -> Session:
         """Get a new database session."""

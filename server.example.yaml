@@ -8,7 +8,7 @@
 #   - SERVER_SCAN_ON_STARTUP, SERVER_SCAN_INTERVAL_SECONDS
 #   - OPENLIST_BASE_URL, OPENLIST_USER, OPENLIST_PASS, OPENLIST_OTP
 #   - ROUTES_JSON
-#   - WORKER_TOKEN_*, WORKER_TOKENS
+#   - WORKER_TOKEN_*, WORKER_TOKENS, WORKER_TOKENS_SCOPES_JSON
 
 db_url: sqlite:///shrink_media_server.db
 
@@ -25,7 +25,12 @@ server:
   scan_interval_seconds: 300 # 0=disable periodic scan
 
 bootstrap_tokens:
+  # 无 scope：可处理所有 route + 所有 kind（image/video/audio/comic/subtitle/other）
   - dev-token-001
+  # 带 scope（可选）：限制该 token 注册出来的 worker 只能 lease 特定任务
+  # - token: token-r1-image
+  #   allow_routes: [photos]   # route id 列表
+  #   allow_kinds: [image]     # kind 列表：image/video/audio/comic/subtitle/other
 
 routes:
   - id: photos

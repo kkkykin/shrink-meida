@@ -69,6 +69,14 @@ export WORKER_TOKEN_2=secret-token-xyz
 export WORKER_TOKENS=secret-token-abc,secret-token-xyz
 ```
 
+可选：为 bootstrap token 配置 scope（限制该 token 注册出来的 worker 只能 lease 指定 `route_id` / `kind` 的任务）：
+
+```bash
+export WORKER_TOKENS_SCOPES_JSON='{"secret-token-abc":{"allow_routes":["photos"],"allow_kinds":["image"]}}'
+```
+
+注意：scope 会写入 worker（注册时生成的 `WORKER_TOKEN`）。如果你修改了 scope，需要让 worker 重新注册（清空 `WORKER_TOKEN`，仅设置 `WORKER_BOOTSTRAP_TOKEN` 再启动）。
+
 #### 2.4 其他配置
 
 ```bash
