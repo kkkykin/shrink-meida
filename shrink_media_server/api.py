@@ -469,6 +469,7 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
 
         # Find available tasks (queued or expired leases)
         now = datetime.now(timezone.utc)
+        copy_route_ids = [r.id for r in config.routes if (r.mode or "compress").strip().lower() == "copy"]
         q = (
             session.query(Task)
             .filter(
@@ -479,6 +480,8 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
         )
         if allow_routes is not None:
             q = q.filter(Task.route_id.in_(allow_routes))
+        if copy_route_ids:
+            q = q.filter(~Task.route_id.in_(copy_route_ids))
 
         # NOTE: kind filtering is done in Python (cheap, extension-based) to avoid DB schema coupling.
         max_scan = min(5000, max(int(req.n) * 50, 200))

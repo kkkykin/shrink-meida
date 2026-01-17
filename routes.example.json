@@ -2,11 +2,13 @@
   {
     "id": "from1",
     "in_root": "/test/from1",
-    "out_root": "/test/to1"
+    "out_root": "/test/to1",
+    "mode": "compress"
   },
   {
     "id": "from2",
     "in_root": "/test/from2",
-    "out_root": "/test/to2"
+    "out_root": "/test/to2",
+    "mode": "copy"
   }
 ]

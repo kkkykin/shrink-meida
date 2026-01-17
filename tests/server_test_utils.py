@@ -7,7 +7,7 @@ import unittest
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from fastapi.testclient import TestClient
@@ -36,6 +36,7 @@ class FakeOpenListManager:
         otp_key: Optional[str] = None,
     ):
         self.base_url = base_url.rstrip("/")
+        self.client = object()
         self.files: dict[str, FakeRemoteInfo] = {}
         self.dirs: set[str] = set()
 
@@ -76,6 +77,15 @@ class FakeOpenListManager:
         info.path = dst
         info.name = Path(dst).name
         self.files[dst] = info
+
+    def copy(self, src: str, dst_dir: str):
+        if src not in self.files:
+            raise FileNotFoundError(src)
+        dst = str(PurePosixPath(dst_dir.rstrip("/") or "/") / Path(src).name)
+        if dst in self.files:
+            raise FileExistsError(dst)
+        info = self.files[src]
+        self.files[dst] = FakeRemoteInfo(path=dst, size=int(info.size), name=Path(dst).name)
 
     def remove(self, path: str):
         self.files.pop(path, None)

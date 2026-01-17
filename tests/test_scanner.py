@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from shrink_media_server.config import Route, ServerConfig
 from shrink_media_server.models import Database, Task
+from server_test_utils import FakeOpenListManager, FakeRemoteInfo
 
 
 @dataclass
@@ -140,3 +141,55 @@ class TestScanner(ScannerHarness):
             ("r2", "/in2/sub/c.png", "sub/c.png", json.dumps({"image_codec": "webp"}, ensure_ascii=False, separators=(",", ":"))),
             got,
         )
+
+    def test_scan_all_routes_processes_copy_routes_via_openlist_copy(self) -> None:
+        from shrink_media_server.scanner import scan_all_routes
+
+        config = ServerConfig(
+            db_url="sqlite:///ignored.sqlite",
+            openlist_base_url="http://openlist.invalid",
+            openlist_user="user",
+            openlist_password="pass",
+            openlist_otp=None,
+            routes=[
+                Route(id="r1", in_root="/in1", out_root="/out1", mode="copy", profile={}),
+                Route(id="r2", in_root="/in2", out_root="/out2", profile={}),
+            ],
+            bootstrap_tokens=["bootstrap-token"],
+            host="127.0.0.1",
+            port=8000,
+            scan_on_startup=True,
+            scan_interval_seconds=0,
+        )
+
+        def fake_iter(_client, root_path: str):  # noqa: ANN001
+            if root_path == "/in1":
+                return iter([_FakeEntry(path="/in1/a.mov", is_dir=False, size=1, mtime_ns=1)])
+            if root_path == "/in2":
+                return iter([_FakeEntry(path="/in2/b.mov", is_dir=False, size=2, mtime_ns=2)])
+            raise AssertionError(f"unexpected root_path: {root_path}")
+
+        openlist = FakeOpenListManager()
+        openlist.files["/in1/a.mov"] = FakeRemoteInfo(path="/in1/a.mov", size=1, name="a.mov")
+        openlist.files["/in2/b.mov"] = FakeRemoteInfo(path="/in2/b.mov", size=2, name="b.mov")
+
+        with patch("shrink_media_server.scanner.iter_openlist_recursive", side_effect=fake_iter):
+            summary = scan_all_routes(config, openlist, self.session)  # type: ignore[arg-type]
+
+        self.assertEqual(summary, {"r1": {"created": 1, "skipped": 0}, "r2": {"created": 1, "skipped": 0}})
+
+        # r1 copied on server; r2 stays queued for workers.
+        tasks = self.session.query(Task).order_by(Task.route_id).all()
+        self.assertEqual(len(tasks), 2)
+        t_copy = next(t for t in tasks if t.route_id == "r1")
+        t_compress = next(t for t in tasks if t.route_id == "r2")
+
+        self.assertEqual(t_copy.status, "finalized")
+        self.assertEqual(t_copy.action, "copy")
+        self.assertEqual(t_copy.final_path, "/out1/a.mov")
+        self.assertEqual(int(t_copy.out_size), 1)
+        self.assertIn("/out1/a.mov", openlist.files)
+
+        self.assertEqual(t_compress.status, "queued")
+        self.assertIsNone(t_compress.action)
+        self.assertNotIn("/out2/b.mov", openlist.files)

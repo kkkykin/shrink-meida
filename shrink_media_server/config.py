@@ -13,6 +13,7 @@ import yaml
 _MISSING = object()
 
 _ALLOWED_TASK_KINDS = {"image", "video", "audio", "comic", "subtitle", "other"}
+_ALLOWED_ROUTE_MODES = {"compress", "copy"}
 
 
 @dataclass
@@ -21,6 +22,9 @@ class Route:
     id: str
     in_root: str
     out_root: str
+    # compress: worker downloads -> transcodes/copies -> uploads staging -> server finalizes
+    # copy: server uses OpenList remote copy (no download/upload)
+    mode: str = "compress"
     profile: Optional[dict] = None
 
 
@@ -504,10 +508,16 @@ class ServerConfig:
         """Parse routes from JSON data."""
         routes = []
         for item in data:
+            mode_raw = item.get("mode", "compress")
+            mode = str(mode_raw).strip().lower() if mode_raw is not None else "compress"
+            if mode not in _ALLOWED_ROUTE_MODES:
+                allowed = ", ".join(sorted(_ALLOWED_ROUTE_MODES))
+                raise ValueError(f"routes: invalid mode {mode!r} (allowed: {allowed})")
             routes.append(Route(
                 id=item["id"],
                 in_root=item["in_root"],
                 out_root=item["out_root"],
+                mode=mode,
                 profile=item.get("profile"),
             ))
         return routes

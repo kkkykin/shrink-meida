@@ -58,6 +58,10 @@ export OPENLIST_OTP=123456  # 可选，2FA
 export ROUTES_JSON='[{"id":"default","in_root":"/input","out_root":"/output"}]'
 ```
 
+每条 route 可选设置 `mode`（默认 `compress`）：
+- `compress`: 走现有 worker 流水线（下载 → 转码/复制 → 上传到 staging → server finalize）
+- `copy`: server 直接调用 OpenList 远端 `copy` 到输出目录（不下载/不上传；worker 不会 lease 该 route 的任务）
+
 #### 2.3 Worker 认证 Token
 
 ```bash

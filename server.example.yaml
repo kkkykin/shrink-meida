@@ -37,6 +37,10 @@ routes:
   - id: photos
     in_root: /photos/raw
     out_root: /photos/compressed
+    # mode: compress|copy (default: compress)
+    # - compress: worker 下载/转码/上传，server finalize
+    # - copy: server 直接调用 OpenList 远端 copy（不下载/不上传）
+    mode: compress
 
   - id: videos
     in_root: /videos/source

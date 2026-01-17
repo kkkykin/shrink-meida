@@ -176,6 +176,10 @@ class OpenListManager:
         """Move a file into destination directory."""
         self.client.move(src, dst_dir)
 
+    def copy(self, src: str, dst_dir: str):
+        """Copy a file into destination directory (server-side remote copy)."""
+        self.client.copy(src, dst_dir)
+
     def remove(self, path: str):
         """Remove a file."""
         self.client.remove(path)
