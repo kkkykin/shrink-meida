@@ -75,6 +75,8 @@ export WORKER_TOKENS=secret-token-abc,secret-token-xyz
 export SERVER_DB_URL=sqlite:///shrink_media_server.db  # 默认
 export SERVER_HOST=0.0.0.0  # 默认 127.0.0.1
 export SERVER_PORT=8000     # 默认
+export SERVER_SCAN_ON_STARTUP=1          # 默认 1
+export SERVER_SCAN_INTERVAL_SECONDS=300  # 默认 300；设为 0 表示只启动时扫描一次
 ```
 
 ### 3. 启动 Server

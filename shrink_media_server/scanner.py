@@ -74,7 +74,6 @@ def scan_all_routes(config: ServerConfig, openlist: OpenListManager, session: Se
     summary = {}
 
     for route in config.routes:
-        print(f"Scanning route {route.id}: {route.in_root} -> {route.out_root}")
         created, skipped = scan_route(
             session=session,
             openlist=openlist,
@@ -83,6 +82,5 @@ def scan_all_routes(config: ServerConfig, openlist: OpenListManager, session: Se
             profile=route.profile,
         )
         summary[route.id] = {"created": created, "skipped": skipped}
-        print(f"  Created: {created}, Skipped: {skipped}")
 
     return summary

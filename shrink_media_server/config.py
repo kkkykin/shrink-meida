@@ -44,6 +44,8 @@ class ServerConfig:
     # Server settings
     host: str
     port: int
+    scan_on_startup: bool
+    scan_interval_seconds: int
 
     @classmethod
     def from_env(cls) -> ServerConfig:
@@ -182,6 +184,21 @@ class ServerConfig:
             yaml_port = cls._pick_yaml(config_yaml, ("port",), ("server", "port"))
             port = cls._coerce_int(yaml_port) if yaml_port is not _MISSING else 8000
 
+        scan_on_startup_env = os.environ.get("SERVER_SCAN_ON_STARTUP")
+        if scan_on_startup_env is not None:
+            scan_on_startup = cls._coerce_bool(scan_on_startup_env)
+        else:
+            yaml_scan_on_startup = cls._pick_yaml(config_yaml, ("scan_on_startup",), ("server", "scan_on_startup"))
+            scan_on_startup = cls._coerce_bool(yaml_scan_on_startup) if yaml_scan_on_startup is not _MISSING else True
+
+        scan_interval_env = os.environ.get("SERVER_SCAN_INTERVAL_SECONDS")
+        if scan_interval_env is not None:
+            scan_interval_seconds = int(scan_interval_env)
+        else:
+            yaml_scan_interval = cls._pick_yaml(config_yaml, ("scan_interval_seconds",), ("server", "scan_interval_seconds"))
+            scan_interval_seconds = cls._coerce_int(yaml_scan_interval) if yaml_scan_interval is not _MISSING else 300
+        scan_interval_seconds = max(0, int(scan_interval_seconds))
+
         return cls(
             db_url=db_url,
             openlist_base_url=openlist_base_url,
@@ -192,6 +209,8 @@ class ServerConfig:
             bootstrap_tokens=bootstrap_tokens,
             host=host,
             port=port,
+            scan_on_startup=scan_on_startup,
+            scan_interval_seconds=scan_interval_seconds,
         )
 
     @staticmethod
@@ -231,6 +250,20 @@ class ServerConfig:
         if isinstance(v, str):
             return int(v.strip())
         raise TypeError(f"expected int, got {type(v).__name__}")
+
+    @staticmethod
+    def _coerce_bool(v: object) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return v != 0
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in {"1", "true", "yes", "y", "on"}:
+                return True
+            if s in {"0", "false", "no", "n", "off", ""}:
+                return False
+        raise TypeError(f"expected bool, got {type(v).__name__}")
 
     @staticmethod
     def _yaml_get(data: dict[str, Any], path: tuple[str, ...]) -> object:

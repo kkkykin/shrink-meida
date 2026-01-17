@@ -102,6 +102,8 @@ class TestScanner(ScannerHarness):
             bootstrap_tokens=["bootstrap-token"],
             host="127.0.0.1",
             port=8000,
+            scan_on_startup=True,
+            scan_interval_seconds=0,
         )
 
         def fake_iter(_client, root_path: str):  # noqa: ANN001
@@ -118,10 +120,7 @@ class TestScanner(ScannerHarness):
 
         openlist = SimpleNamespace(client=object())
 
-        with (
-            patch("shrink_media_server.scanner.iter_openlist_recursive", side_effect=fake_iter),
-            patch("builtins.print"),
-        ):
+        with patch("shrink_media_server.scanner.iter_openlist_recursive", side_effect=fake_iter):
             summary = scan_all_routes(config, openlist, self.session)  # type: ignore[arg-type]
 
         self.assertEqual(summary, {"r1": {"created": 1, "skipped": 0}, "r2": {"created": 2, "skipped": 0}})
@@ -141,4 +140,3 @@ class TestScanner(ScannerHarness):
             ("r2", "/in2/sub/c.png", "sub/c.png", json.dumps({"image_codec": "webp"}, ensure_ascii=False, separators=(",", ":"))),
             got,
         )
-

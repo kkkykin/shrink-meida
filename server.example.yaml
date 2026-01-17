@@ -5,6 +5,7 @@
 #
 # Environment variables override YAML values:
 #   - SERVER_CONFIG_FILE, SERVER_DB_URL, SERVER_HOST, SERVER_PORT
+#   - SERVER_SCAN_ON_STARTUP, SERVER_SCAN_INTERVAL_SECONDS
 #   - OPENLIST_BASE_URL, OPENLIST_USER, OPENLIST_PASS, OPENLIST_OTP
 #   - ROUTES_JSON
 #   - WORKER_TOKEN_*, WORKER_TOKENS
@@ -20,6 +21,8 @@ openlist:
 server:
   host: 127.0.0.1
   port: 8000
+  scan_on_startup: true
+  scan_interval_seconds: 300 # 0=disable periodic scan
 
 bootstrap_tokens:
   - dev-token-001

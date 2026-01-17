@@ -8,7 +8,9 @@ import re
 import secrets
 import shutil
 import tempfile
+import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Literal, Optional
@@ -225,7 +227,79 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
         otp_key=config.openlist_otp,
     )
 
-    app = FastAPI(title="shrink_media_server")
+    def _scan_once(*, reason: str) -> None:
+        if not config.routes:
+            logger.info("Route scan skipped: no routes configured", extra={"reason": reason})
+            return
+
+        from .scanner import scan_all_routes
+
+        started = time.time()
+        session = db.get_session()
+        try:
+            summary = scan_all_routes(config, openlist, session)
+        except Exception:
+            logger.exception("Route scan failed", extra={"reason": reason})
+            return
+        finally:
+            session.close()
+
+        elapsed_s = time.time() - started
+        created_total = sum(int(v.get("created", 0) or 0) for v in summary.values())
+        skipped_total = sum(int(v.get("skipped", 0) or 0) for v in summary.values())
+        logger.info(
+            "Route scan complete",
+            extra={
+                "reason": reason,
+                "routes": len(summary),
+                "created": created_total,
+                "skipped": skipped_total,
+                "elapsed_s": round(elapsed_s, 3),
+            },
+        )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        stop_event = threading.Event()
+        scan_thread: threading.Thread | None = None
+
+        def _loop():
+            if config.scan_on_startup:
+                _scan_once(reason="startup")
+
+            interval = int(config.scan_interval_seconds or 0)
+            if interval <= 0:
+                return
+
+            while not stop_event.wait(timeout=interval):
+                _scan_once(reason="interval")
+
+        if config.scan_on_startup or int(config.scan_interval_seconds or 0) > 0:
+            scan_thread = threading.Thread(target=_loop, name="shrink_media_scan_loop", daemon=True)
+            scan_thread.start()
+            logger.info(
+                "Background scan enabled",
+                extra={
+                    "scan_on_startup": bool(config.scan_on_startup),
+                    "scan_interval_seconds": int(config.scan_interval_seconds or 0),
+                },
+            )
+
+        try:
+            yield
+        finally:
+            stop_event.set()
+            if scan_thread is not None:
+                scan_thread.join(timeout=1.0)
+                if scan_thread.is_alive():
+                    logger.warning("Scan thread still running during shutdown; skipping OpenList close")
+                    return
+            try:
+                openlist.close()
+            except Exception:
+                logger.exception("Failed to close OpenList client")
+
+    app = FastAPI(title="shrink_media_server", lifespan=lifespan)
 
     # Dependency: Get DB session
     def get_db():
