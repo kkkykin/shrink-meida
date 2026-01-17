@@ -386,13 +386,21 @@ class Worker:
                 },
             )
             print(f"[{task_id}] Failed: {e}")
+            retryable = True
+            if isinstance(e, httpx.HTTPStatusError):
+                try:
+                    status_code = int(e.response.status_code)
+                except Exception:
+                    status_code = None
+                if status_code in {401, 403, 404}:
+                    retryable = False
             try:
                 resp = self.client.post(
                     f"{self.config.server_url}/v1/tasks/{task_id}/fail",
                     json={
                         "worker_id": self.worker_id,
                         "err": str(e),
-                        "retryable": True,
+                        "retryable": retryable,
                     },
                     headers=self._auth_headers(),
                 )

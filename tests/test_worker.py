@@ -9,6 +9,8 @@ from unittest.mock import Mock, patch
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
+
 from server_test_utils import FakeRemoteInfo, ServerHarness
 
 
@@ -413,6 +415,40 @@ class TestWorkerProcessFlow(ServerHarness):
         self.assertEqual(task_obj.status, "queued")
         self.assertEqual(task_obj.last_error, "boom")
         self.assertIsNone(task_obj.lease_worker_id)
+
+    def test_process_task_download_unauthorized_is_not_retryable(self) -> None:
+        worker_id, worker_token = self.register_worker()
+        task_id = self.create_task(src_path="/in/a.mov", src_rel="a.mov", src_size=11)
+        task = self._lease_one(worker_id=worker_id, worker_token=worker_token)
+        self.assertEqual(task["task_id"], task_id)
+
+        worker = self._make_worker(worker_id=worker_id, worker_token=worker_token)
+
+        def fake_download(url: str, _dest: Path, *, headers: dict | None = None, timeout: int = 300) -> None:
+            _ = headers, timeout
+            req = httpx.Request("GET", url)
+            resp = httpx.Response(401, request=req)
+            resp.raise_for_status()
+
+        with (
+            patch("shrink_media_worker.worker.download_file", side_effect=fake_download),
+            patch("builtins.print"),
+        ):
+            worker.process_task(task)
+
+        task_obj = self.get_task(task_id)
+        self.assertIsNotNone(task_obj)
+        self.assertEqual(task_obj.status, "deadletter")
+        self.assertIn("401", str(task_obj.last_error or ""))
+
+        # Ensure it won't be leased again.
+        r = self.client.post(
+            "/v1/tasks/lease",
+            headers=self._auth_headers(worker_token),
+            json={"worker_id": worker_id, "n": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["tasks"], [])
 
     def test_process_task_direct_upload_does_not_leak_worker_token(self) -> None:
         worker_id, worker_token = self.register_worker()
