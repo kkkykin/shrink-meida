@@ -758,6 +758,12 @@ class OpenListClientSync:
             op="rename",
         )
 
+    def move(self, src: str, dst_dir: str) -> None:
+        assert self._client is not None
+        src_p = src if src.startswith("/") else f"/{src}"
+        dst_p = dst_dir if dst_dir.startswith("/") else f"/{dst_dir}"
+        self._call_retry(lambda: self._client.fs.move(src_p, dst_p), op="move")
+
     # ---- 其他 ----
     def ensure_dir(self, path: str) -> None:
         assert self._client is not None

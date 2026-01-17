@@ -342,9 +342,10 @@ def init_app() -> FastAPI:
 
             # Parse profile
             try:
-                profile = json.loads(task.profile_json) if task.profile_json else {}
+                profile0 = json.loads(task.profile_json) if task.profile_json else {}
             except Exception:
-                profile = {}
+                profile0 = {}
+            profile = profile0 if isinstance(profile0, dict) else {}
 
             logger.info(
                 "Task leased",

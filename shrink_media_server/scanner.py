@@ -52,7 +52,7 @@ def scan_route(
             src_size=entry.size,
             src_mtime_ns=entry.mtime_ns,
             status="queued",
-            profile_json=json.dumps(profile, ensure_ascii=False, separators=(",", ":")),
+            profile_json=json.dumps(profile or {}, ensure_ascii=False, separators=(",", ":")),
         )
 
         try:

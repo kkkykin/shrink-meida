@@ -106,7 +106,10 @@ class OpenListManager:
 
     def info(self, path: str):
         """Get file/directory info."""
-        info = self.client.info(path)
+        try:
+            info = self.client.info(path)
+        except FileNotFoundError:
+            return None
         if info is None:
             return None
         name = getattr(info, "name", None)
@@ -139,6 +142,10 @@ class OpenListManager:
     def rename(self, src: str, dst: str):
         """Rename/move a file."""
         self.client.rename(src, dst)
+
+    def move(self, src: str, dst_dir: str):
+        """Move a file into destination directory."""
+        self.client.move(src, dst_dir)
 
     def remove(self, path: str):
         """Remove a file."""
@@ -188,8 +195,10 @@ class OpenListManager:
             if parent_dir and parent_dir != "/":
                 self.ensure_dir(parent_dir)
 
-            # Rename staging to final
-            self.rename(staging_path, final_path)
+            # Move staging to final directory, then rename to final basename.
+            self.move(staging_path, parent_dir)
+            moved_path = str(posixpath.join(parent_dir or "/", Path(staging_path).name))
+            self.rename(moved_path, final_path)
 
             # Verify final file
             final_info = self.info(final_path)
