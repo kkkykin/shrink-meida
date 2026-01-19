@@ -39,6 +39,7 @@ class FakeOpenListManager:
         self.client = object()
         self.files: dict[str, FakeRemoteInfo] = {}
         self.dirs: set[str] = set()
+        self.copy_calls: list[tuple[str, str]] = []
 
     def get_download_url(self, path: str, *, base_url: str | None = None) -> dict:
         p = path if path.startswith("/") else f"/{path}"
@@ -84,8 +85,7 @@ class FakeOpenListManager:
         dst = str(PurePosixPath(dst_dir.rstrip("/") or "/") / Path(src).name)
         if dst in self.files:
             raise FileExistsError(dst)
-        info = self.files[src]
-        self.files[dst] = FakeRemoteInfo(path=dst, size=int(info.size), name=Path(dst).name)
+        self.copy_calls.append((src, dst_dir))
 
     def remove(self, path: str):
         self.files.pop(path, None)

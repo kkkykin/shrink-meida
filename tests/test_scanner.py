@@ -188,8 +188,91 @@ class TestScanner(ScannerHarness):
         self.assertEqual(t_copy.action, "copy")
         self.assertEqual(t_copy.final_path, "/out1/a.mov")
         self.assertEqual(int(t_copy.out_size), 1)
-        self.assertIn("/out1/a.mov", openlist.files)
+        self.assertNotIn("/out1/a.mov", openlist.files)
+        self.assertIn(("/in1/a.mov", "/out1"), openlist.copy_calls)
 
         self.assertEqual(t_compress.status, "queued")
         self.assertIsNone(t_compress.action)
         self.assertNotIn("/out2/b.mov", openlist.files)
+
+    def test_copy_mode_skips_when_destination_exists_with_same_size(self) -> None:
+        from shrink_media_server.scanner import scan_all_routes
+
+        config = ServerConfig(
+            db_url="sqlite:///ignored.sqlite",
+            openlist_base_url="http://openlist.invalid",
+            openlist_user="user",
+            openlist_password="pass",
+            openlist_otp=None,
+            routes=[
+                Route(id="r1", in_root="/in1", out_root="/out1", mode="copy", profile={}),
+            ],
+            bootstrap_tokens=["bootstrap-token"],
+            host="127.0.0.1",
+            port=8000,
+            scan_on_startup=True,
+            scan_interval_seconds=0,
+        )
+
+        def fake_iter(_client, root_path: str):  # noqa: ANN001
+            if root_path == "/in1":
+                return iter([_FakeEntry(path="/in1/a.mov", is_dir=False, size=1, mtime_ns=1)])
+            raise AssertionError(f"unexpected root_path: {root_path}")
+
+        openlist = FakeOpenListManager()
+        openlist.files["/in1/a.mov"] = FakeRemoteInfo(path="/in1/a.mov", size=1, name="a.mov")
+        openlist.files["/out1/a.mov"] = FakeRemoteInfo(path="/out1/a.mov", size=1, name="a.mov")
+
+        with patch("shrink_media_server.scanner.iter_openlist_recursive", side_effect=fake_iter):
+            summary = scan_all_routes(config, openlist, self.session)  # type: ignore[arg-type]
+
+        self.assertEqual(summary, {"r1": {"created": 1, "skipped": 0}})
+
+        t_copy = self.session.query(Task).one()
+        self.assertEqual(t_copy.status, "finalized")
+        self.assertEqual(t_copy.action, "copy")
+        self.assertEqual(t_copy.final_path, "/out1/a.mov")
+        self.assertEqual(int(t_copy.out_size), 1)
+        self.assertEqual(openlist.copy_calls, [])
+
+    def test_copy_mode_deadletters_when_destination_exists_with_different_size(self) -> None:
+        from shrink_media_server.scanner import scan_all_routes
+
+        config = ServerConfig(
+            db_url="sqlite:///ignored.sqlite",
+            openlist_base_url="http://openlist.invalid",
+            openlist_user="user",
+            openlist_password="pass",
+            openlist_otp=None,
+            routes=[
+                Route(id="r1", in_root="/in1", out_root="/out1", mode="copy", profile={}),
+            ],
+            bootstrap_tokens=["bootstrap-token"],
+            host="127.0.0.1",
+            port=8000,
+            scan_on_startup=True,
+            scan_interval_seconds=0,
+        )
+
+        def fake_iter(_client, root_path: str):  # noqa: ANN001
+            if root_path == "/in1":
+                return iter([_FakeEntry(path="/in1/a.mov", is_dir=False, size=1, mtime_ns=1)])
+            raise AssertionError(f"unexpected root_path: {root_path}")
+
+        openlist = FakeOpenListManager()
+        openlist.files["/in1/a.mov"] = FakeRemoteInfo(path="/in1/a.mov", size=1, name="a.mov")
+        openlist.files["/out1/a.mov"] = FakeRemoteInfo(path="/out1/a.mov", size=999, name="a.mov")
+
+        with patch("shrink_media_server.scanner.iter_openlist_recursive", side_effect=fake_iter):
+            summary = scan_all_routes(config, openlist, self.session)  # type: ignore[arg-type]
+
+        self.assertEqual(summary, {"r1": {"created": 1, "skipped": 0}})
+
+        t_copy = self.session.query(Task).one()
+        self.assertEqual(t_copy.status, "deadletter")
+        self.assertEqual(t_copy.action, "copy")
+        self.assertEqual(t_copy.final_path, "/out1/a.mov")
+        self.assertIsNone(t_copy.out_size)
+        self.assertIsNotNone(t_copy.last_error)
+        self.assertIn("final path exists with different size", str(t_copy.last_error))
+        self.assertEqual(openlist.copy_calls, [])

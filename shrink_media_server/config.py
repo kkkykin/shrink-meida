@@ -66,6 +66,9 @@ class ServerConfig:
     port: int
     scan_on_startup: bool
     scan_interval_seconds: int
+    # Copy-mode task processing batch size (server-side OpenList remote copy submission).
+    # Smaller batches reduce DB contention and avoid long scan loops.
+    copy_batch_size: int = 50
     bootstrap_token_scopes: dict[str, BootstrapTokenScope] = field(default_factory=dict)
 
     @classmethod
@@ -262,6 +265,19 @@ class ServerConfig:
             scan_interval_seconds = cls._coerce_int(yaml_scan_interval) if yaml_scan_interval is not _MISSING else 300
         scan_interval_seconds = max(0, int(scan_interval_seconds))
 
+        # Copy-mode task processing: env > yaml > default
+        copy_batch_size_env = os.environ.get("SERVER_COPY_BATCH_SIZE")
+        if copy_batch_size_env is not None:
+            copy_batch_size = int(copy_batch_size_env)
+        else:
+            yaml_copy_batch_size = cls._pick_yaml(
+                config_yaml,
+                ("copy_batch_size",),
+                ("server", "copy_batch_size"),
+            )
+            copy_batch_size = cls._coerce_int(yaml_copy_batch_size) if yaml_copy_batch_size is not _MISSING else 50
+        copy_batch_size = max(1, int(copy_batch_size))
+
         return cls(
             db_url=db_url,
             openlist_base_url=openlist_base_url,
@@ -275,6 +291,7 @@ class ServerConfig:
             port=port,
             scan_on_startup=scan_on_startup,
             scan_interval_seconds=scan_interval_seconds,
+            copy_batch_size=copy_batch_size,
         )
 
     @staticmethod

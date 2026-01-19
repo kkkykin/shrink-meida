@@ -177,7 +177,11 @@ class OpenListManager:
         self.client.move(src, dst_dir)
 
     def copy(self, src: str, dst_dir: str):
-        """Copy a file into destination directory (server-side remote copy)."""
+        """Copy a file into destination directory (server-side remote copy).
+
+        The underlying OpenList API may accept the copy task asynchronously, so a successful call
+        does not necessarily mean the destination file is already visible.
+        """
         self.client.copy(src, dst_dir)
 
     def remove(self, path: str):

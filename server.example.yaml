@@ -5,7 +5,7 @@
 #
 # Environment variables override YAML values:
 #   - SERVER_CONFIG_FILE, SERVER_DB_URL, SERVER_HOST, SERVER_PORT
-#   - SERVER_SCAN_ON_STARTUP, SERVER_SCAN_INTERVAL_SECONDS
+#   - SERVER_SCAN_ON_STARTUP, SERVER_SCAN_INTERVAL_SECONDS, SERVER_COPY_BATCH_SIZE
 #   - OPENLIST_BASE_URL, OPENLIST_USER, OPENLIST_PASS, OPENLIST_OTP
 #   - ROUTES_JSON
 #   - WORKER_TOKEN_*, WORKER_TOKENS, WORKER_TOKENS_SCOPES_JSON
@@ -23,6 +23,7 @@ server:
   port: 8000
   scan_on_startup: true
   scan_interval_seconds: 300 # 0=disable periodic scan by default (routes can override)
+  copy_batch_size: 50 # copy-mode 每批提交/落库数量（不是总上限）
 
 bootstrap_tokens:
   # 无 scope：可处理所有 route + 所有 kind（image/video/audio/comic/subtitle/other）

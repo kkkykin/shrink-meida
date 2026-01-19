@@ -20,7 +20,7 @@ def process_copy_tasks(
     config: ServerConfig,
     openlist: OpenListManager,
     session: Session,
-    limit: int = 1000,
+    batch_size: int = 50,
 ) -> int:
     """
     Process tasks for routes configured with mode=copy.
@@ -32,110 +32,159 @@ def process_copy_tasks(
     if not copy_routes:
         return 0
 
-    now = datetime.now(timezone.utc)
+    batch_size = max(1, int(batch_size))
     copy_route_ids = sorted(copy_routes.keys())
-    q = (
-        session.query(Task)
-        .filter(
-            Task.route_id.in_(copy_route_ids),
-            (
-                (Task.status == "queued")
-                | (Task.status == "failed")
-                | ((Task.status == "leased") & (Task.lease_expires_at < now))
-            ),
-            Task.attempts < Task.max_attempts,
-        )
-        .order_by(Task.updated_at.asc())
-        .limit(max(1, int(limit)))
-    )
+    ensured_dirs: set[str] = set()
 
-    tasks = q.all()
     finalized = 0
+    run_started_at = datetime.now(timezone.utc)
 
-    for task in tasks:
-        route = copy_routes.get(task.route_id)
-        if route is None:
-            continue
+    while True:
+        now = datetime.now(timezone.utc)
+        q = (
+            session.query(
+                Task.id,
+                Task.route_id,
+                Task.src_path,
+                Task.src_rel,
+                Task.src_size,
+                Task.status,
+                Task.lease_expires_at,
+            )
+            .filter(
+                Task.route_id.in_(copy_route_ids),
+                (
+                    (Task.status == "queued")
+                    | (Task.status == "failed")
+                    | ((Task.status == "leased") & (Task.lease_expires_at < now))
+                ),
+                Task.attempts < Task.max_attempts,
+                Task.updated_at <= run_started_at,
+            )
+            .order_by(Task.updated_at.asc())
+            .limit(batch_size)
+        )
 
-        # Safety: if it's currently leased (and not expired), don't steal it.
-        if task.status == "leased" and task.lease_expires_at is not None and task.lease_expires_at >= now:
-            continue
+        rows = q.all()
+        session.rollback()
+        if not rows:
+            return finalized
 
-        task.attempts += 1
-        task.staging_path = None
-        task.lease_worker_id = None
-        task.lease_expires_at = None
+        results: list[
+            tuple[str, bool, str | None, Exception | None, str, int, datetime, datetime]
+        ] = []
 
-        out_root_path = PurePosixPath(route.out_root.rstrip("/") or "/")
-        final_path = str(out_root_path / PurePosixPath(task.src_rel))
-        expected_size = int(task.src_size)
+        for task_id, route_id, src_path, src_rel, src_size, status, lease_expires_at in rows:
+            route = copy_routes.get(route_id)
+            if route is None:
+                continue
 
-        ok = False
-        err: str | None = None
+            # Safety: if it's currently leased (and not expired), don't steal it.
+            if status == "leased" and lease_expires_at is not None and lease_expires_at >= now:
+                continue
 
-        try:
-            final_info = openlist.info(final_path)
-            if final_info:
-                final_size = int(getattr(final_info, "size", 0) or 0)
-                if final_size == expected_size:
-                    ok = True
+            out_root_path = PurePosixPath(route.out_root.rstrip("/") or "/")
+            final_path = str(out_root_path / PurePosixPath(src_rel))
+            expected_size = int(src_size)
+
+            ok = False
+            err: str | None = None
+            exc: Exception | None = None
+            started_at = datetime.now(timezone.utc)
+
+            try:
+                final_info = openlist.info(final_path)
+                if final_info:
+                    final_size = int(getattr(final_info, "size", 0) or 0)
+                    if final_size == expected_size:
+                        ok = True
+                    else:
+                        err = f"final path exists with different size: {final_size} != {expected_size}"
                 else:
-                    err = f"final path exists with different size: {final_size} != {expected_size}"
-            else:
-                dst_dir = str(PurePosixPath(final_path).parent)
-                openlist.ensure_dir(dst_dir)
-                openlist.copy(task.src_path, dst_dir)
+                    dst_dir = str(PurePosixPath(final_path).parent)
+                    if dst_dir not in ensured_dirs:
+                        openlist.ensure_dir(dst_dir)
+                        ensured_dirs.add(dst_dir)
 
-                final_info2 = openlist.info(final_path)
-                if not final_info2:
-                    err = "copied file not found"
-                else:
-                    final_size2 = int(getattr(final_info2, "size", 0) or 0)
-                    if final_size2 != expected_size:
-                        err = f"copied size mismatch: {final_size2} != {expected_size}"
+                    try:
+                        openlist.copy(src_path, dst_dir)
+                    except FileExistsError:
+                        final_info2 = openlist.info(final_path)
+                        if final_info2:
+                            final_size2 = int(getattr(final_info2, "size", 0) or 0)
+                            if final_size2 == expected_size:
+                                ok = True
+                            else:
+                                err = f"final path exists with different size: {final_size2} != {expected_size}"
+                        else:
+                            ok = True
                     else:
                         ok = True
-        except FileNotFoundError as e:
-            err = f"copy failed: {e}"
-        except Exception as e:
-            err = f"copy failed: {e}"
+            except FileNotFoundError as e:
+                exc = e
+                err = f"copy submit failed: {e}"
+            except Exception as e:
+                exc = e
+                err = f"copy submit failed: {e}"
 
-        task.final_path = final_path
-        task.action = "copy"
-        task.updated_at = now
+            finished_at = datetime.now(timezone.utc)
+            results.append((task_id, ok, err, exc, final_path, expected_size, started_at, finished_at))
 
-        if ok:
-            task.status = "finalized"
-            task.out_size = expected_size
-            task.last_error = None
-            finalized += 1
-        else:
-            err_l = (err or "").lower()
-            non_retryable = "final path exists with different size" in err_l
-            source_missing = "not found" in err_l
-            retryable = bool(err) and (not non_retryable) and (not source_missing)
-            if not retryable:
-                task.status = "deadletter"
+        if not results:
+            continue
+
+        task_ids = [task_id for task_id, *_rest in results]
+        tasks = session.query(Task).filter(Task.id.in_(task_ids)).all()
+        task_by_id = {t.id: t for t in tasks}
+        attempts_to_add: list[Attempt] = []
+
+        for task_id, ok, err, exc, final_path, expected_size, started_at, finished_at in results:
+            task = task_by_id.get(task_id)
+            if task is None:
+                continue
+
+            task.attempts += 1
+            task.staging_path = None
+            task.lease_worker_id = None
+            task.lease_expires_at = None
+            task.final_path = final_path
+            task.action = "copy"
+            task.updated_at = finished_at
+
+            if ok:
+                task.status = "finalized"
+                task.out_size = expected_size
+                task.last_error = None
+                finalized += 1
             else:
-                task.status = "queued" if task.attempts < int(task.max_attempts) else "deadletter"
-            task.out_size = None
-            task.last_error = err or "copy failed"
+                err_l = (err or "").lower()
+                non_retryable = "final path exists with different size" in err_l
+                source_missing = isinstance(exc, FileNotFoundError) or "not found" in err_l
+                retryable = bool(err) and (not non_retryable) and (not source_missing)
+                if not retryable:
+                    task.status = "deadletter"
+                else:
+                    task.status = "queued" if task.attempts < int(task.max_attempts) else "deadletter"
+                task.out_size = None
+                task.last_error = err or "copy submit failed"
 
-        session.add(
-            Attempt(
-                task_id=task.id,
-                worker_id=None,
-                started_at=now,
-                finished_at=now,
-                ok=1 if ok else 0,
-                action="copy",
-                err=None if ok else (err or "copy failed"),
-                metrics_json=None,
+            attempts_to_add.append(
+                Attempt(
+                    task_id=task.id,
+                    worker_id=None,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    ok=1 if ok else 0,
+                    action="copy",
+                    err=None if ok else (err or "copy submit failed"),
+                    metrics_json=None,
+                ),
             )
-        )
 
-    session.commit()
-    return finalized
+        if attempts_to_add:
+            session.add_all(attempts_to_add)
+
+        session.commit()
 
 
 def scan_route(
@@ -208,6 +257,6 @@ def scan_all_routes(config: ServerConfig, openlist: OpenListManager, session: Se
         summary[route.id] = {"created": created, "skipped": skipped}
 
     # Execute copy-mode tasks on server (no worker involved).
-    process_copy_tasks(config=config, openlist=openlist, session=session)
+    process_copy_tasks(config=config, openlist=openlist, session=session, batch_size=int(getattr(config, "copy_batch_size", 50)))
 
     return summary

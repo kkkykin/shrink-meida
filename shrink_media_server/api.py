@@ -310,7 +310,12 @@ def init_app(*, config_file: Path | None = None) -> FastAPI:
                     summary[route.id] = {"created": created, "skipped": skipped}
 
                 # Execute copy-mode tasks on server (no worker involved).
-                process_copy_tasks(config=config, openlist=openlist, session=session)
+                process_copy_tasks(
+                    config=config,
+                    openlist=openlist,
+                    session=session,
+                    batch_size=int(getattr(config, "copy_batch_size", 50)),
+                )
         except Exception:
             logger.exception("Route scan failed", extra={"reason": reason})
             return

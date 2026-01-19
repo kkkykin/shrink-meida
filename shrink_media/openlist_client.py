@@ -765,7 +765,11 @@ class OpenListClientSync:
         self._call_retry(lambda: self._client.fs.move(src_p, dst_p), op="move")
 
     def copy(self, src: str, dst_dir: str) -> None:
-        """Server-side remote copy (OpenList fs.copy)."""
+        """Server-side remote copy (OpenList fs.copy).
+
+        Note: OpenList may execute copy asynchronously; a successful HTTP response can mean the
+        copy task was accepted, not that the destination file is already visible.
+        """
         assert self._client is not None
         src_p = src if src.startswith("/") else f"/{src}"
         dst_p = dst_dir if dst_dir.startswith("/") else f"/{dst_dir}"
