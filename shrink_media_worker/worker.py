@@ -220,7 +220,7 @@ class Worker:
                     video_policy=profile.get("video_policy", "transcode"),
                     audio_policy=profile.get("audio_policy", "transcode"),
                     allow_opus_in_mp4=profile.get("allow_opus_in_mp4", False),
-                    video_encoder=profile.get("video_encoder", "libx264"),
+                    video_encoder=profile.get("video_encoder", "auto"),
                     video_crf=profile.get("video_crf", 23),
                     video_preset=profile.get("video_preset", "medium"),
                     pix_fmt=profile.get("pix_fmt", "yuv420p"),

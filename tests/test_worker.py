@@ -194,6 +194,7 @@ class TestWorkerProcessFlow(ServerHarness):
             dest.write_bytes(b"x" * int(task["src_size"]))
 
         def fake_process_one_local(**kwargs: Any):
+            self.assertEqual(kwargs["video_encoder"], "auto")
             out_local = Path(kwargs["out_root"]) / "out.mp4"
             out_local.write_bytes(b"y" * 9)
             return _FakeProcessResult(ok=True, action="copy", msg="fallback copy", out_local=out_local)
