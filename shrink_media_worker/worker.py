@@ -42,6 +42,8 @@ class WorkerConfig:
     worker_name: str = "worker"
     lease_batch_size: int = 1
     heartbeat_interval: int = 60  # seconds
+    lease_poll_interval: int = 5  # seconds (base, exponential backoff)
+    lease_poll_max_interval: int = 60  # seconds (cap, exponential backoff)
     max_inflight_tasks: int = 2
     download_concurrency: int = 2
     transcode_concurrency: int = 1
@@ -66,6 +68,8 @@ class WorkerConfig:
         worker_name = os.getenv("WORKER_NAME", f"worker-{os.getpid()}")
         lease_batch_size = _pos_int("WORKER_LEASE_BATCH_SIZE", 1)
         heartbeat_interval = _pos_int("WORKER_HEARTBEAT_INTERVAL", 60)
+        lease_poll_interval = _pos_int("WORKER_LEASE_POLL_INTERVAL_SECONDS", 5)
+        lease_poll_max_interval = _pos_int("WORKER_LEASE_POLL_MAX_INTERVAL_SECONDS", 60)
         max_inflight_tasks = _pos_int("WORKER_MAX_INFLIGHT_TASKS", 2)
         download_concurrency = _pos_int("WORKER_DOWNLOAD_CONCURRENCY", 2)
         transcode_concurrency = _pos_int("WORKER_TRANSCODE_CONCURRENCY", 1)
@@ -78,6 +82,8 @@ class WorkerConfig:
             worker_name=worker_name,
             lease_batch_size=lease_batch_size,
             heartbeat_interval=heartbeat_interval,
+            lease_poll_interval=lease_poll_interval,
+            lease_poll_max_interval=lease_poll_max_interval,
             max_inflight_tasks=max_inflight_tasks,
             download_concurrency=download_concurrency,
             transcode_concurrency=transcode_concurrency,
@@ -523,17 +529,27 @@ class Worker:
                 "download_concurrency": int(self.config.download_concurrency),
                 "transcode_concurrency": int(self.config.transcode_concurrency),
                 "upload_concurrency": int(self.config.upload_concurrency),
+                "lease_poll_base_interval_s": int(self.config.lease_poll_interval),
+                "lease_poll_max_interval_s": int(self.config.lease_poll_max_interval),
             },
         )
         in_flight: set[Future[None]] = set()
         leased_once = False
         max_inflight = max(1, int(self.config.max_inflight_tasks))
+        lease_poll_base_interval = max(1, int(self.config.lease_poll_interval))
+        lease_poll_max_interval = max(lease_poll_base_interval, int(self.config.lease_poll_max_interval))
+        lease_backoff = lease_poll_base_interval
+        next_lease_at = 0.0  # monotonic seconds
 
         with ThreadPoolExecutor(max_workers=max_inflight) as executor:
             while self.running:
                 try:
                     # Drain completed tasks first so we can lease more.
                     done = {f for f in in_flight if f.done()}
+                    if done:
+                        # Progress happened; allow leasing immediately (avoid waiting full backoff interval).
+                        next_lease_at = 0.0
+                        lease_backoff = lease_poll_base_interval
                     for f in done:
                         in_flight.remove(f)
                         try:
@@ -552,13 +568,16 @@ class Worker:
 
                     # Lease up to remaining capacity (bounded).
                     capacity = max_inflight - len(in_flight)
-                    if capacity > 0 and (not once or not leased_once):
+                    now_mono = time.monotonic()
+                    if capacity > 0 and (not once or not leased_once) and now_mono >= next_lease_at:
                         lease_n = min(int(self.config.lease_batch_size), capacity)
                         tasks = self.lease_tasks(n=lease_n)
                         if once:
                             leased_once = True
 
                         if tasks:
+                            next_lease_at = 0.0
+                            lease_backoff = lease_poll_base_interval
                             for task in tasks:
                                 if not self.running or self.shutting_down:
                                     break
@@ -569,17 +588,27 @@ class Worker:
                             print("No tasks available (--once mode)")
                             break
 
+                        # No tasks available right now; exponential backoff lease polling to avoid spamming server.
+                        current_backoff = lease_backoff
+                        next_lease_at = time.monotonic() + current_backoff
+                        lease_backoff = min(lease_poll_max_interval, lease_backoff * 2)
                         if in_flight:
-                            wait(in_flight, timeout=1.0, return_when=FIRST_COMPLETED)
+                            wait(in_flight, timeout=current_backoff, return_when=FIRST_COMPLETED)
                         else:
-                            time.sleep(5)
+                            time.sleep(current_backoff)
                         continue
 
                     # No capacity or (--once and already leased): wait for progress.
                     if in_flight:
-                        wait(in_flight, timeout=1.0, return_when=FIRST_COMPLETED)
+                        timeout = None
+                        if capacity > 0 and (not once or not leased_once) and next_lease_at > 0.0:
+                            timeout = max(0.0, next_lease_at - time.monotonic())
+                        wait(in_flight, timeout=timeout, return_when=FIRST_COMPLETED)
                     else:
-                        time.sleep(1)
+                        if capacity > 0 and (not once or not leased_once) and next_lease_at > 0.0:
+                            time.sleep(max(0.0, next_lease_at - time.monotonic()))
+                        else:
+                            time.sleep(1)
 
                 except KeyboardInterrupt:
                     print("\nShutting down...")

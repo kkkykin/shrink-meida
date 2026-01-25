@@ -139,6 +139,8 @@ export WORKER_TOKEN=已注册的worker-token        # 已注册后使用
 export WORKER_NAME=worker-01
 export WORKER_LEASE_BATCH_SIZE=1   # 每次 lease 最大获取任务数（会按剩余并发容量自动下调）
 export WORKER_HEARTBEAT_INTERVAL=60  # 心跳间隔（秒）
+export WORKER_LEASE_POLL_INTERVAL_SECONDS=5  # lease 返回空列表时的轮询间隔（秒，指数退避 base）
+export WORKER_LEASE_POLL_MAX_INTERVAL_SECONDS=60  # lease 指数退避最大间隔（秒）
 
 # 并发/流水线配置（跨任务并行：下载/转码/上传可重叠）
 export WORKER_MAX_INFLIGHT_TASKS=2     # 同时处理的 task 上限（线程池大小）
