@@ -540,8 +540,8 @@ class Worker:
         lease_poll_max_interval = max(lease_poll_base_interval, int(self.config.lease_poll_max_interval))
         lease_backoff = lease_poll_base_interval
         next_lease_at = 0.0  # monotonic seconds
-
-        with ThreadPoolExecutor(max_workers=max_inflight) as executor:
+        executor = ThreadPoolExecutor(max_workers=max_inflight)
+        try:
             while self.running:
                 try:
                     # Drain completed tasks first so we can lease more.
@@ -600,7 +600,7 @@ class Worker:
 
                     # No capacity or (--once and already leased): wait for progress.
                     if in_flight:
-                        timeout = None
+                        timeout = 0.5
                         if capacity > 0 and (not once or not leased_once) and next_lease_at > 0.0:
                             timeout = max(0.0, next_lease_at - time.monotonic())
                         wait(in_flight, timeout=timeout, return_when=FIRST_COMPLETED)
@@ -611,7 +611,8 @@ class Worker:
                             time.sleep(1)
 
                 except KeyboardInterrupt:
-                    print("\nShutting down...")
+                    print("\nShutting down... (press Ctrl-C again to force exit)")
+                    self.request_shutdown()
                     self.running = False
                     break
                 except Exception as e:
@@ -620,10 +621,19 @@ class Worker:
                     if once:
                         break
                     time.sleep(5)
+        finally:
+            # Avoid blocking forever in ThreadPoolExecutor.__exit__ during shutdown.
+            executor.shutdown(wait=False)
 
             if in_flight:
-                print("Waiting for in-flight tasks to finish...")
-                wait(in_flight)
+                print("Waiting for in-flight tasks to finish... (press Ctrl-C again to force exit)")
+                while in_flight:
+                    done = {f for f in in_flight if f.done()}
+                    for f in done:
+                        in_flight.remove(f)
+                    if not in_flight:
+                        break
+                    wait(in_flight, timeout=0.5, return_when=FIRST_COMPLETED)
 
         print("Worker stopped")
 
@@ -666,9 +676,11 @@ def main() -> None:
     def signal_handler(signum, frame):
         _ = frame
         if worker.shutting_down:
+            print("\nForce exiting...")
             os._exit(128 + int(signum))
         worker.request_shutdown()
         if signum == signal.SIGINT:
+            print("\nReceived SIGINT, shutting down... (press Ctrl-C again to force exit)")
             raise KeyboardInterrupt
         print(f"\nReceived signal {signum}, requesting shutdown...")
 
