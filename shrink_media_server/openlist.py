@@ -75,8 +75,6 @@ class OpenListManager:
         Returns: {upload_url: str, method: str, chunk_size: int, headers: dict} or None
         """
         try:
-            from pathlib import Path
-
             payload = {
                 "path": str(Path(dst_path).parent).replace("\\", "/"),
                 "file_name": Path(dst_path).name,
@@ -114,14 +112,18 @@ class OpenListManager:
             if not upload_url:
                 return None
 
-            if base_url is not None:
-                upload_url = self._rewrite_url_base(str(upload_url), base_url=base_url)
-            elif isinstance(upload_url, str) and upload_url.startswith("/"):
+            upload_url_str = str(upload_url)
+            # IMPORTANT: `upload_url` may be a pre-signed URL for a storage backend (e.g. S3).
+            # Never rewrite the host for absolute URLs, otherwise the signature may become invalid.
+            u = urlsplit(upload_url_str)
+            is_absolute = bool(u.scheme and u.netloc)
+            if not is_absolute:
                 # Make sure workers don't treat it as a server-relative URL.
-                upload_url = f"{self.base_url}{upload_url}"
+                base = base_url if base_url is not None else self.base_url
+                upload_url_str = self._rewrite_url_base(upload_url_str, base_url=base)
 
             return {
-                "url": upload_url,
+                "url": upload_url_str,
                 "method": method,
                 "chunk_size": chunk_size,
                 "headers": {},
