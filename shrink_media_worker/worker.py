@@ -264,7 +264,7 @@ class Worker:
                         "ok": result.ok,
                         "action": result.action,
                         "ffmpeg_rc": getattr(result, "ffmpeg_rc", None),
-                        "msg": result.msg[:200] if result.msg else None,
+                        "result_msg": result.msg[:200] if result.msg else None,
                     },
                 )
 
@@ -383,7 +383,7 @@ class Worker:
                         "task_id": task_id,
                         "total_time_s": round(task_time, 2),
                         "action": action,
-                        "msg": result.msg[:200] if result.msg else None,
+                        "result_msg": result.msg[:200] if result.msg else None,
                     },
                 )
                 print(f"[{task_id}] Completed ({action}): {result.msg}")
