@@ -1,6 +1,7 @@
 """Worker main loop for shrink_media C/S architecture."""
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import logging
 import os
 import signal
@@ -41,16 +42,34 @@ class WorkerConfig:
     worker_name: str = "worker"
     lease_batch_size: int = 1
     heartbeat_interval: int = 60  # seconds
+    max_inflight_tasks: int = 2
+    download_concurrency: int = 2
+    transcode_concurrency: int = 1
+    upload_concurrency: int = 2
 
     @classmethod
     def from_env(cls) -> WorkerConfig:
         """Load configuration from environment variables."""
+        def _pos_int(name: str, default: int) -> int:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            try:
+                value = int(raw)
+            except ValueError:
+                return default
+            return max(1, value)
+
         server_url = os.getenv("WORKER_SERVER_URL", "http://localhost:8000")
         bootstrap_token = os.getenv("WORKER_BOOTSTRAP_TOKEN")
         worker_token = os.getenv("WORKER_TOKEN")
         worker_name = os.getenv("WORKER_NAME", f"worker-{os.getpid()}")
-        lease_batch_size = int(os.getenv("WORKER_LEASE_BATCH_SIZE", "1"))
-        heartbeat_interval = int(os.getenv("WORKER_HEARTBEAT_INTERVAL", "60"))
+        lease_batch_size = _pos_int("WORKER_LEASE_BATCH_SIZE", 1)
+        heartbeat_interval = _pos_int("WORKER_HEARTBEAT_INTERVAL", 60)
+        max_inflight_tasks = _pos_int("WORKER_MAX_INFLIGHT_TASKS", 2)
+        download_concurrency = _pos_int("WORKER_DOWNLOAD_CONCURRENCY", 2)
+        transcode_concurrency = _pos_int("WORKER_TRANSCODE_CONCURRENCY", 1)
+        upload_concurrency = _pos_int("WORKER_UPLOAD_CONCURRENCY", 2)
 
         return cls(
             server_url=server_url.rstrip("/"),
@@ -59,6 +78,10 @@ class WorkerConfig:
             worker_name=worker_name,
             lease_batch_size=lease_batch_size,
             heartbeat_interval=heartbeat_interval,
+            max_inflight_tasks=max_inflight_tasks,
+            download_concurrency=download_concurrency,
+            transcode_concurrency=transcode_concurrency,
+            upload_concurrency=upload_concurrency,
         )
 
 
@@ -76,6 +99,31 @@ class Worker:
         self.active_tasks: dict[str, dict] = {}
         self.heartbeat_thread: Optional[threading.Thread] = None
         self.current_task_id: Optional[str] = None
+        self._client_lock = threading.Lock()
+        self._download_sem = threading.Semaphore(self.config.download_concurrency)
+        self._transcode_sem = threading.Semaphore(self.config.transcode_concurrency)
+        self._upload_sem = threading.Semaphore(self.config.upload_concurrency)
+
+    def _client_get(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ):  # noqa: ANN201 - response type depends on client
+        with self._client_lock:
+            return self.client.get(url, headers=headers, timeout=timeout)
+
+    def _client_post(
+        self,
+        url: str,
+        *,
+        json: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ):  # noqa: ANN201 - response type depends on client
+        with self._client_lock:
+            return self.client.post(url, json=json, headers=headers, timeout=timeout)
 
     def _auth_headers(self) -> dict[str, str]:
         """Get authorization headers."""
@@ -92,7 +140,7 @@ class Worker:
         if self.worker_token:
             # Already have token, verify it works and discover worker_id.
             try:
-                resp = self.client.get(f"{self.config.server_url}/v1/workers/me", headers=self._auth_headers())
+                resp = self._client_get(f"{self.config.server_url}/v1/workers/me", headers=self._auth_headers())
                 resp.raise_for_status()
                 data = resp.json()
                 self.worker_id = int(data["worker_id"])
@@ -110,7 +158,7 @@ class Worker:
             raise RuntimeError("No bootstrap token provided (set WORKER_BOOTSTRAP_TOKEN)")
 
         caps = detect_capabilities()
-        resp = self.client.post(
+        resp = self._client_post(
             f"{self.config.server_url}/v1/workers/register",
             json={"name": self.config.worker_name, "caps": caps},
             headers={"Authorization": f"Bearer {self.config.bootstrap_token}"},
@@ -127,11 +175,12 @@ class Worker:
             print(f"Worker scope: allow_kinds={allow_kinds}, allow_routes={allow_routes}")
         print("Save this token to WORKER_TOKEN env var for future runs")
 
-    def lease_tasks(self) -> list[dict]:
+    def lease_tasks(self, *, n: int | None = None) -> list[dict]:
         """Lease tasks from server."""
-        resp = self.client.post(
+        n = int(n if n is not None else self.config.lease_batch_size)
+        resp = self._client_post(
             f"{self.config.server_url}/v1/tasks/lease",
-            json={"worker_id": self.worker_id, "n": self.config.lease_batch_size},
+            json={"worker_id": self.worker_id, "n": max(1, n)},
             headers=self._auth_headers(),
         )
         resp.raise_for_status()
@@ -141,7 +190,7 @@ class Worker:
     def heartbeat_task(self, task_id: str) -> None:
         """Send heartbeat for a task."""
         try:
-            resp = self.client.post(
+            resp = self._client_post(
                 f"{self.config.server_url}/v1/tasks/{task_id}/heartbeat",
                 json={"worker_id": self.worker_id},
                 headers=self._auth_headers(),
@@ -193,7 +242,8 @@ class Worker:
 
                 print(f"[{task_id}] Downloading from {download_url}")
                 dl_start = time.time()
-                download_file(download_url, src_local, headers=download_headers)
+                with self._download_sem:
+                    download_file(download_url, src_local, headers=download_headers)
                 dl_time = time.time() - dl_start
                 logger.info(
                     "Download complete",
@@ -224,36 +274,37 @@ class Worker:
                 _ensure_process_one_local()
 
                 transcode_start = time.time()
-                result = process_one_local(
-                    src_local=src_in_root,
-                    in_root=in_root,
-                    out_root=out_root,
-                    container=profile.get("container", "mp4"),
-                    video_policy=profile.get("video_policy", "transcode"),
-                    audio_policy=profile.get("audio_policy", "transcode"),
-                    allow_opus_in_mp4=profile.get("allow_opus_in_mp4", False),
-                    video_encoder=profile.get("video_encoder", "auto"),
-                    video_crf=profile.get("video_crf", 23),
-                    video_preset=profile.get("video_preset", "medium"),
-                    pix_fmt=profile.get("pix_fmt", "yuv420p"),
-                    image_codec=profile.get("image_codec", "webp"),
-                    webp_quality=profile.get("webp_quality", 85),
-                    webp_lossless=profile.get("webp_lossless", False),
-                    avif_crf=profile.get("avif_crf", 28),
-                    avif_pix_fmt=profile.get("avif_pix_fmt", "yuv420p"),
-                    faststart=profile.get("faststart", True),
-                    overwrite=True,
-                    dry_run=False,
-                    min_savings=profile.get("min_savings", 0.05),
-                    try_archives=profile.get("try_archives", True),
-                    comic_min_images=profile.get("comic_min_images", 3),
-                    comic_keep_non_images=profile.get("comic_keep_non_images", False),
-                    comic_accept_bigger=profile.get("comic_accept_bigger", False),
-                    archive_password=profile.get("archive_password"),
-                    tolerate_corrupt=profile.get("tolerate_corrupt", False),
-                    out_name_mode="suffix",
-                    src_size_hint=task["src_size"],
-                )
+                with self._transcode_sem:
+                    result = process_one_local(
+                        src_local=src_in_root,
+                        in_root=in_root,
+                        out_root=out_root,
+                        container=profile.get("container", "mp4"),
+                        video_policy=profile.get("video_policy", "transcode"),
+                        audio_policy=profile.get("audio_policy", "transcode"),
+                        allow_opus_in_mp4=profile.get("allow_opus_in_mp4", False),
+                        video_encoder=profile.get("video_encoder", "auto"),
+                        video_crf=profile.get("video_crf", 23),
+                        video_preset=profile.get("video_preset", "medium"),
+                        pix_fmt=profile.get("pix_fmt", "yuv420p"),
+                        image_codec=profile.get("image_codec", "webp"),
+                        webp_quality=profile.get("webp_quality", 85),
+                        webp_lossless=profile.get("webp_lossless", False),
+                        avif_crf=profile.get("avif_crf", 28),
+                        avif_pix_fmt=profile.get("avif_pix_fmt", "yuv420p"),
+                        faststart=profile.get("faststart", True),
+                        overwrite=True,
+                        dry_run=False,
+                        min_savings=profile.get("min_savings", 0.05),
+                        try_archives=profile.get("try_archives", True),
+                        comic_min_images=profile.get("comic_min_images", 3),
+                        comic_keep_non_images=profile.get("comic_keep_non_images", False),
+                        comic_accept_bigger=profile.get("comic_accept_bigger", False),
+                        archive_password=profile.get("archive_password"),
+                        tolerate_corrupt=profile.get("tolerate_corrupt", False),
+                        out_name_mode="suffix",
+                        src_size_hint=task["src_size"],
+                    )
                 transcode_time = time.time() - transcode_start
 
                 logger.info(
@@ -278,7 +329,7 @@ class Worker:
                 # Handle skip action
                 if action == "skip":
                     print(f"[{task_id}] Skipped: {result.msg}")
-                    resp = self.client.post(
+                    resp = self._client_post(
                         f"{self.config.server_url}/v1/tasks/{task_id}/complete",
                         json={
                             "worker_id": self.worker_id,
@@ -302,7 +353,7 @@ class Worker:
 
                 # Get upload capability
                 print(f"[{task_id}] Requesting upload capability...")
-                resp = self.client.post(
+                resp = self._client_post(
                     f"{self.config.server_url}/v1/tasks/{task_id}/upload_intent",
                     json={
                         "worker_id": self.worker_id,
@@ -330,13 +381,14 @@ class Worker:
 
                 upload_start = time.time()
                 try:
-                    upload_file_chunked(
-                        upload_url,
-                        result.out_local,
-                        method=upload_info.get("method", "PUT"),
-                        chunk_size=upload_info.get("chunk_size", 5 * 1024 * 1024),
-                        headers=upload_headers,
-                    )
+                    with self._upload_sem:
+                        upload_file_chunked(
+                            upload_url,
+                            result.out_local,
+                            method=upload_info.get("method", "PUT"),
+                            chunk_size=upload_info.get("chunk_size", 5 * 1024 * 1024),
+                            headers=upload_headers,
+                        )
                 except httpx.HTTPStatusError as e:
                     body = (e.response.text or "").strip()
                     if body:
@@ -360,7 +412,7 @@ class Worker:
 
                 # Complete
                 print(f"[{task_id}] Completing...")
-                resp = self.client.post(
+                resp = self._client_post(
                     f"{self.config.server_url}/v1/tasks/{task_id}/complete",
                     json={
                         "worker_id": self.worker_id,
@@ -399,7 +451,7 @@ class Worker:
             )
             print(f"[{task_id}] Interrupted")
             try:
-                resp = self.client.post(
+                resp = self._client_post(
                     f"{self.config.server_url}/v1/tasks/{task_id}/fail",
                     json={
                         "worker_id": self.worker_id,
@@ -435,7 +487,7 @@ class Worker:
                 if status_code in {401, 403, 404}:
                     retryable = False
             try:
-                resp = self.client.post(
+                resp = self._client_post(
                     f"{self.config.server_url}/v1/tasks/{task_id}/fail",
                     json={
                         "worker_id": self.worker_id,
@@ -464,39 +516,85 @@ class Worker:
 
         # Main loop
         print("\nWorker started, waiting for tasks...")
-        while self.running:
-            try:
-                if self.shutting_down:
-                    break
+        logger.info(
+            "Worker concurrency configured",
+            extra={
+                "max_inflight_tasks": int(self.config.max_inflight_tasks),
+                "download_concurrency": int(self.config.download_concurrency),
+                "transcode_concurrency": int(self.config.transcode_concurrency),
+                "upload_concurrency": int(self.config.upload_concurrency),
+            },
+        )
+        in_flight: set[Future[None]] = set()
+        leased_once = False
+        max_inflight = max(1, int(self.config.max_inflight_tasks))
 
-                # Lease tasks
-                tasks = self.lease_tasks()
-                if not tasks:
+        with ThreadPoolExecutor(max_workers=max_inflight) as executor:
+            while self.running:
+                try:
+                    # Drain completed tasks first so we can lease more.
+                    done = {f for f in in_flight if f.done()}
+                    for f in done:
+                        in_flight.remove(f)
+                        try:
+                            f.result()
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception:
+                            logger.exception("Unhandled exception in worker task")
+
+                    if self.shutting_down:
+                        break
+
+                    if once and leased_once and not in_flight:
+                        print("Completed one lease cycle (--once mode)")
+                        break
+
+                    # Lease up to remaining capacity (bounded).
+                    capacity = max_inflight - len(in_flight)
+                    if capacity > 0 and (not once or not leased_once):
+                        lease_n = min(int(self.config.lease_batch_size), capacity)
+                        tasks = self.lease_tasks(n=lease_n)
+                        if once:
+                            leased_once = True
+
+                        if tasks:
+                            for task in tasks:
+                                if not self.running or self.shutting_down:
+                                    break
+                                in_flight.add(executor.submit(self.process_task, task))
+                            continue
+
+                        if once:
+                            print("No tasks available (--once mode)")
+                            break
+
+                        if in_flight:
+                            wait(in_flight, timeout=1.0, return_when=FIRST_COMPLETED)
+                        else:
+                            time.sleep(5)
+                        continue
+
+                    # No capacity or (--once and already leased): wait for progress.
+                    if in_flight:
+                        wait(in_flight, timeout=1.0, return_when=FIRST_COMPLETED)
+                    else:
+                        time.sleep(1)
+
+                except KeyboardInterrupt:
+                    print("\nShutting down...")
+                    self.running = False
+                    break
+                except Exception as e:
+                    print(f"Error in main loop: {e}")
+                    logger.exception("Error in main loop")
                     if once:
-                        print("No tasks available (--once mode)")
                         break
                     time.sleep(5)
-                    continue
 
-                # Process tasks
-                for task in tasks:
-                    if not self.running or self.shutting_down:
-                        break
-                    self.process_task(task)
-
-                if once:
-                    print("Completed one lease cycle (--once mode)")
-                    break
-
-            except KeyboardInterrupt:
-                print("\nShutting down...")
-                self.running = False
-                break
-            except Exception as e:
-                print(f"Error in main loop: {e}")
-                if once:
-                    break
-                time.sleep(5)
+            if in_flight:
+                print("Waiting for in-flight tasks to finish...")
+                wait(in_flight)
 
         print("Worker stopped")
 
@@ -509,7 +607,8 @@ class Worker:
         if self.heartbeat_thread:
             self.heartbeat_thread.join(timeout=5)
             self.heartbeat_thread = None
-        self.client.close()
+        with self._client_lock:
+            self.client.close()
 
 
 def main() -> None:

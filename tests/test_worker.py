@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -782,3 +783,150 @@ class TestWorkerTransport(unittest.TestCase):
             self.assertEqual(out, {"ok": True})
             self.assertEqual(request_calls, 3)
             self.assertEqual(sleep_durations, [1])
+
+
+class TestWorkerConcurrency(ServerHarness):
+    def test_run_overlaps_download_transcode_and_upload(self) -> None:
+        worker_id, worker_token = self.register_worker()
+
+        task_id1 = self.create_task(src_path="/in/a1.mov", src_rel="a1.mov", src_size=10)
+        task_id2 = self.create_task(src_path="/in/a2.mov", src_rel="a2.mov", src_size=10)
+
+        from shrink_media_worker.worker import Worker, WorkerConfig
+
+        config = WorkerConfig(
+            server_url="http://testserver",
+            worker_token=worker_token,
+            lease_batch_size=2,
+            heartbeat_interval=3600,
+            max_inflight_tasks=2,
+            download_concurrency=2,
+            transcode_concurrency=1,
+            upload_concurrency=1,
+        )
+        worker = Worker(config)
+        worker.client = _TestClientHttpAdapter(self.client)  # type: ignore[assignment]
+
+        transcode1_started = threading.Event()
+        allow_transcode1_finish = threading.Event()
+        download2_started = threading.Event()
+        upload1_started = threading.Event()
+        allow_upload1_finish = threading.Event()
+        transcode2_started = threading.Event()
+
+        def fake_download(url: str, dest: Path, *, headers: dict | None = None, timeout: int = 300) -> None:
+            _ = headers, timeout
+            if url.endswith("/in/a2.mov"):
+                self.assertTrue(transcode1_started.wait(timeout=5.0))
+                download2_started.set()
+            dest.write_bytes(b"x" * 10)
+
+        def fake_process_one_local(**kwargs: Any):
+            src_local = Path(kwargs["src_local"])
+            out_root = Path(kwargs["out_root"])
+
+            if src_local.name == "a1.mov":
+                transcode1_started.set()
+                self.assertTrue(allow_transcode1_finish.wait(timeout=5.0))
+                out_local = out_root / "a1.mp4"
+                out_local.write_bytes(b"1" * 9)
+                return _FakeProcessResult(ok=True, action="ok", msg="ok", out_local=out_local)
+
+            if src_local.name == "a2.mov":
+                self.assertTrue(upload1_started.wait(timeout=5.0))
+                transcode2_started.set()
+                out_local = out_root / "a2.mp4"
+                out_local.write_bytes(b"2" * 9)
+                return _FakeProcessResult(ok=True, action="ok", msg="ok", out_local=out_local)
+
+            raise AssertionError(f"unexpected src_local: {src_local}")
+
+        def fake_upload_file_chunked(
+            url: str,
+            src: Path,
+            *,
+            method: str = "PUT",
+            chunk_size: int = 5 * 1024 * 1024,
+            headers: dict | None = None,
+            timeout: int = 300,
+        ) -> dict:
+            _ = chunk_size, timeout
+            if src.name == "a1.mp4":
+                upload1_started.set()
+                self.assertTrue(allow_upload1_finish.wait(timeout=5.0))
+
+            headers = headers or {}
+            self.assertEqual(headers.get("Authorization"), f"Bearer {worker_token}")
+
+            path = _url_to_testclient_path(url)
+            resp = self.client.request(method, path, content=src.read_bytes(), headers=headers)
+            self.assertEqual(resp.status_code, 200, resp.text)
+            return resp.json()
+
+        run_exc: list[BaseException] = []
+
+        def run_worker() -> None:
+            try:
+                worker.run(once=True)
+            except BaseException as e:  # noqa: BLE001 - capture for assertion
+                run_exc.append(e)
+
+        with (
+            patch("shrink_media_worker.worker.download_file", side_effect=fake_download),
+            patch("shrink_media_worker.worker.process_one_local", side_effect=fake_process_one_local),
+            patch("shrink_media_worker.worker.upload_file_chunked", side_effect=fake_upload_file_chunked),
+            patch("builtins.print"),
+        ):
+            t = threading.Thread(target=run_worker, daemon=True)
+            t.start()
+
+            self.assertTrue(transcode1_started.wait(timeout=5.0))
+            self.assertTrue(download2_started.wait(timeout=5.0))
+            t1_mid = self.get_task(task_id1)
+            t2_mid = self.get_task(task_id2)
+            self.assertIsNotNone(t1_mid)
+            self.assertIsNotNone(t2_mid)
+            self.assertEqual(t1_mid.status, "leased")
+            self.assertEqual(int(t1_mid.lease_worker_id or 0), worker_id)
+            self.assertEqual(int(t1_mid.attempts or 0), 1)
+            self.assertIsNone(t1_mid.staging_path)
+            self.assertIsNone(t1_mid.final_path)
+            self.assertEqual(t2_mid.status, "leased")
+            self.assertEqual(int(t2_mid.lease_worker_id or 0), worker_id)
+            self.assertEqual(int(t2_mid.attempts or 0), 1)
+            self.assertIsNone(t2_mid.staging_path)
+            self.assertIsNone(t2_mid.final_path)
+
+            allow_transcode1_finish.set()
+            self.assertTrue(upload1_started.wait(timeout=5.0))
+            t1_upload = self.get_task(task_id1)
+            self.assertIsNotNone(t1_upload)
+            self.assertEqual(t1_upload.status, "leased")
+            self.assertEqual(int(t1_upload.lease_worker_id or 0), worker_id)
+            self.assertIsInstance(t1_upload.staging_path, str)
+            self.assertIsInstance(t1_upload.final_path, str)
+            self.assertEqual(t1_upload.action, "ok")
+            self.assertEqual(int(t1_upload.out_size or 0), 9)
+            self.assertTrue(transcode2_started.wait(timeout=5.0))
+
+            allow_upload1_finish.set()
+            t.join(timeout=10.0)
+            self.assertFalse(t.is_alive())
+
+        worker.shutdown()
+        self.assertEqual(run_exc, [])
+
+        task1 = self.get_task(task_id1)
+        task2 = self.get_task(task_id2)
+        self.assertIsNotNone(task1)
+        self.assertIsNotNone(task2)
+        self.assertEqual(task1.status, "finalized")
+        self.assertEqual(task2.status, "finalized")
+        self.assertIsNone(task1.lease_worker_id)
+        self.assertIsNone(task2.lease_worker_id)
+        self.assertIsNone(task1.lease_expires_at)
+        self.assertIsNone(task2.lease_expires_at)
+        self.assertEqual(task1.final_path, f"{self.out_root}/a1__mov.mp4")
+        self.assertEqual(task2.final_path, f"{self.out_root}/a2__mov.mp4")
+        self.assertIn(task1.final_path, self.openlist.files)
+        self.assertIn(task2.final_path, self.openlist.files)

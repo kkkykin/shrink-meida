@@ -137,8 +137,14 @@ export WORKER_TOKEN=已注册的worker-token        # 已注册后使用
 
 # 可选配置
 export WORKER_NAME=worker-01
-export WORKER_LEASE_BATCH_SIZE=1   # 每次获取任务数
+export WORKER_LEASE_BATCH_SIZE=1   # 每次 lease 最大获取任务数（会按剩余并发容量自动下调）
 export WORKER_HEARTBEAT_INTERVAL=60  # 心跳间隔（秒）
+
+# 并发/流水线配置（跨任务并行：下载/转码/上传可重叠）
+export WORKER_MAX_INFLIGHT_TASKS=2     # 同时处理的 task 上限（线程池大小）
+export WORKER_DOWNLOAD_CONCURRENCY=2  # 同时下载数（HTTP GET）
+export WORKER_TRANSCODE_CONCURRENCY=1 # 同时转码数（ffmpeg/7z，建议 1 起步）
+export WORKER_UPLOAD_CONCURRENCY=2    # 同时上传数（HTTP PUT / 分块上传）
 ```
 
 ### 5. 启动 Worker
@@ -147,7 +153,7 @@ export WORKER_HEARTBEAT_INTERVAL=60  # 心跳间隔（秒）
 # 正常启动（持续运行）
 uv run -m shrink_media_worker.worker
 
-# 调试：只执行一轮任务
+# 调试：只 lease 一次，然后等待已领取任务处理完后退出（可能包含多个任务）
 uv run -m shrink_media_worker.worker --once
 
 # 调试：输出引擎侧 ffmpeg candidates/重试/失败尾部日志
@@ -156,8 +162,8 @@ uv run -m shrink_media_worker.worker --debug
 
 Worker 启动后会：
 1. 使用 bootstrap token 注册（首次）或验证已有 token
-2. 循环获取任务（lease）
-3. 下载源文件 → 转码 → 上传到 staging → 报告完成
+2. 循环获取任务（lease，按并发容量拉取）
+3. 多任务并行执行：下载 / 转码 / 上传（跨任务可重叠）
 4. Server 收到 complete 后 finalize 到最终路径
 
 ## 本地开发
