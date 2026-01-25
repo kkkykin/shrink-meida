@@ -375,6 +375,33 @@ class Worker:
                 )
                 print(f"[{task_id}] Completed ({action}): {result.msg}")
 
+        except KeyboardInterrupt:
+            task_time = time.time() - task_start
+            logger.warning(
+                "Task interrupted by SIGINT",
+                extra={
+                    "task_id": task_id,
+                    "total_time_s": round(task_time, 2),
+                },
+            )
+            print(f"[{task_id}] Interrupted")
+            try:
+                resp = self.client.post(
+                    f"{self.config.server_url}/v1/tasks/{task_id}/fail",
+                    json={
+                        "worker_id": self.worker_id,
+                        "err": "worker interrupted (SIGINT)",
+                        "retryable": True,
+                    },
+                    headers=self._auth_headers(),
+                    timeout=5.0,
+                )
+                resp.raise_for_status()
+            except Exception as e2:
+                print(f"[{task_id}] Failed to report interruption: {e2}")
+            self.shutting_down = True
+            self.running = False
+            raise
         except Exception as e:
             task_time = time.time() - task_start
             logger.error(
@@ -488,8 +515,10 @@ def main() -> None:
         _ = frame
         if worker.shutting_down:
             os._exit(128 + int(signum))
-        print(f"\nReceived signal {signum}, requesting shutdown...")
         worker.request_shutdown()
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        print(f"\nReceived signal {signum}, requesting shutdown...")
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

@@ -31,7 +31,14 @@ class _TestClientHttpAdapter:
 
     client: Any
 
-    def get(self, url: str, *, headers: dict[str, str] | None = None):  # noqa: ANN201 - response type depends on client
+    def get(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ):  # noqa: ANN201 - response type depends on client
+        _ = timeout
         return self.client.get(_url_to_testclient_path(url), headers=headers)
 
     def post(
@@ -40,7 +47,9 @@ class _TestClientHttpAdapter:
         *,
         json: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        timeout: float | None = None,
     ):  # noqa: ANN201 - response type depends on client
+        _ = timeout
         return self.client.post(_url_to_testclient_path(url), json=json, headers=headers)
 
     def close(self) -> None:
@@ -415,6 +424,34 @@ class TestWorkerProcessFlow(ServerHarness):
         self.assertIsNotNone(task_obj)
         self.assertEqual(task_obj.status, "queued")
         self.assertEqual(task_obj.last_error, "boom")
+        self.assertIsNone(task_obj.lease_worker_id)
+
+    def test_process_task_keyboard_interrupt_reports_fail_and_reraises(self) -> None:
+        worker_id, worker_token = self.register_worker()
+        task_id = self.create_task(src_path="/in/a.mov", src_rel="a.mov", src_size=11)
+        task = self._lease_one(worker_id=worker_id, worker_token=worker_token)
+        self.assertEqual(task["task_id"], task_id)
+
+        worker = self._make_worker(worker_id=worker_id, worker_token=worker_token)
+
+        def fake_download(_url: str, dest: Path, *, headers: dict | None = None, timeout: int = 300) -> None:
+            dest.write_bytes(b"x" * int(task["src_size"]))
+
+        def fake_process_one_local(**_kwargs: Any):
+            raise KeyboardInterrupt
+
+        with (
+            patch("shrink_media_worker.worker.download_file", side_effect=fake_download),
+            patch("shrink_media_worker.worker.process_one_local", side_effect=fake_process_one_local),
+            patch("builtins.print"),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                worker.process_task(task)
+
+        task_obj = self.get_task(task_id)
+        self.assertIsNotNone(task_obj)
+        self.assertEqual(task_obj.status, "queued")
+        self.assertEqual(task_obj.last_error, "worker interrupted (SIGINT)")
         self.assertIsNone(task_obj.lease_worker_id)
 
     def test_process_task_download_unauthorized_is_not_retryable(self) -> None:
