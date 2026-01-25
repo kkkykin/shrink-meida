@@ -13,8 +13,6 @@ from typing import Any, Optional
 
 import httpx
 
-from shrink_media.processor import process_one_local
-
 from .caps import detect_capabilities
 from .transport import download_file, upload_file_chunked
 
@@ -211,6 +209,8 @@ class Worker:
 
                 # Process
                 print(f"[{task_id}] Transcoding...")
+                from shrink_media.processor import process_one_local
+
                 transcode_start = time.time()
                 result = process_one_local(
                     src_local=src_in_root,
@@ -505,7 +505,18 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="shrink_media worker")
     parser.add_argument("--once", action="store_true", help="Run one lease cycle and exit (for debugging)")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logs (engine ffmpeg candidates, retries, and detailed tracebacks)",
+    )
     args = parser.parse_args()
+
+    if args.debug:
+        from shrink_media.logging import configure_logging
+
+        configure_logging(None, append=True, debug=True, prefetch_debug=False)
+        logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     config = WorkerConfig.from_env()
     worker = Worker(config)
