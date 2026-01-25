@@ -62,6 +62,14 @@ export ROUTES_JSON='[{"id":"default","in_root":"/input","out_root":"/output"}]'
 - `compress`: 走现有 worker 流水线（下载 → 转码/复制 → 上传到 staging → server finalize）
 - `copy`: server 直接调用 OpenList 远端 `copy` 到输出目录（不下载/不上传；worker 不会 lease 该 route 的任务）
 
+#### 2.2 Route Profile（转码参数）
+
+`routes[*].profile` 会原样下发给 worker，用于控制引擎 `ffmpeg/7z` 行为（示例见 `server.example.yaml`）。
+
+常用字段：
+- `video_encoder`: `auto`（优先 NVENC，失败回退 CPU）、`auto_gpu`（尽量用 NVENC；仅在 NVENC 不可用时才用 CPU）、或固定 `hevc_nvenc/libx265/libx264`
+- `tolerate_corrupt`: `true` 时对“可播放但存在坏帧/坏包”的输入更宽容（可能丢坏帧/有瑕疵，但尽量不因解码错误而失败）
+
 #### 2.3 Worker 认证 Token
 
 ```bash
@@ -141,6 +149,9 @@ uv run -m shrink_media_worker.worker
 
 # 调试：只执行一轮任务
 uv run -m shrink_media_worker.worker --once
+
+# 调试：输出引擎侧 ffmpeg candidates/重试/失败尾部日志
+uv run -m shrink_media_worker.worker --debug
 ```
 
 Worker 启动后会：

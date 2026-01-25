@@ -87,6 +87,7 @@ def build_video_cmd_single(
     video_preset: str,
     pix_fmt: str,
     faststart: bool,
+    tolerate_corrupt: bool = False,
 ) -> Tuple[List[str], Optional[List[str]]]:
     streams = info.streams
     has_subs, mp4_sub_ok = detect_subtitle_compat(streams)
@@ -97,11 +98,17 @@ def build_video_cmd_single(
     if container == "mp4" and has_subs and not mp4_sub_ok:
         container = "mkv"
 
-    cmd: List[str] = [
-        "ffmpeg",
-        "-hide_banner",
-        "-nostdin",
-        "-y",
+    cmd: List[str] = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
+    if tolerate_corrupt:
+        cmd += [
+            "-fflags",
+            "+discardcorrupt",
+            "-err_detect",
+            "ignore_err",
+            "-max_error_rate",
+            "1.0",
+        ]
+    cmd += [
         "-i",
         str(in_path),
         "-map",
@@ -222,11 +229,12 @@ def build_video_candidates(
     video_policy: str,
     audio_policy: str,
     allow_opus_in_mp4: bool,
-    video_encoder: str,  # auto/hevc_nvenc/libx265/libx264
+    video_encoder: str,  # auto/auto_gpu/hevc_nvenc/libx265/libx264
     video_crf: int,
     video_preset: str,
     pix_fmt: str,
     faststart: bool,
+    tolerate_corrupt: bool = False,
 ) -> List[List[str]]:
     cands: List[List[str]] = []
 
@@ -244,6 +252,7 @@ def build_video_candidates(
             video_preset=preset_override or video_preset,
             pix_fmt=pix_fmt,
             faststart=faststart,
+            tolerate_corrupt=tolerate_corrupt,
         )
         cands.append(cmd1)
         if retry:
@@ -259,33 +268,41 @@ def build_video_candidates(
                 if bf0_retry:
                     cands.append(bf0_retry)
 
-    if video_encoder == "auto":
+    video_encoder2 = (video_encoder or "").strip().lower()
+    if video_encoder2 == "auto_gpu":
+        want_gpu_only = True
+        video_encoder2 = "auto"
+    else:
+        want_gpu_only = False
+
+    if video_encoder2 == "auto":
         has_nvenc = has_encoder("hevc_nvenc")
         has_x265 = has_encoder("libx265")
         has_x264 = has_encoder("libx264")
 
         if has_nvenc:
             add("hevc_nvenc")
-        if has_x265:
-            add("libx265")
-            if video_preset in {"slow", "slower", "veryslow"}:
-                add("libx265", preset_override="medium")
-        elif has_x264:
-            add("libx264")
+        if not (want_gpu_only and has_nvenc):
+            if has_x265:
+                add("libx265")
+                if video_preset in {"slow", "slower", "veryslow"}:
+                    add("libx265", preset_override="medium")
+            elif has_x264:
+                add("libx264")
 
-        # 最后兜底：当 x265/NVENC 失败时仍尝试 x264（除非强制 always_hevc）。
-        if video_policy != "always_hevc" and has_x264:
-            add("libx264")
+            # 最后兜底：当 x265/NVENC 失败时仍尝试 x264（除非强制 always_hevc）。
+            if video_policy != "always_hevc" and has_x264:
+                add("libx264")
     else:
-        add(video_encoder)
-        if video_encoder == "hevc_nvenc":
+        add(video_encoder2)
+        if video_encoder2 == "hevc_nvenc":
             if has_encoder("libx265"):
                 add("libx265")
                 if video_preset in {"slow", "slower", "veryslow"}:
                     add("libx265", preset_override="medium")
             if video_policy != "always_hevc" and has_encoder("libx264"):
                 add("libx264")
-        if video_encoder == "libx265":
+        if video_encoder2 == "libx265":
             if video_preset in {"slow", "slower", "veryslow"}:
                 add("libx265", preset_override="medium")
             if video_policy != "always_hevc" and has_encoder("libx264"):
@@ -308,6 +325,7 @@ def build_audio_candidates(
     info: MediaInfo,
     *,
     audio_policy: str,
+    tolerate_corrupt: bool = False,
 ) -> List[List[str]]:
     audio_streams = [s for s in info.streams if s.get("codec_type") == "audio"]
     if not audio_streams:
@@ -318,15 +336,22 @@ def build_audio_candidates(
     if c0 in LOSSY_AUDIO_CODECS:
         lossy_in = True
 
+    base_cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
+    if tolerate_corrupt:
+        base_cmd += [
+            "-fflags",
+            "+discardcorrupt",
+            "-err_detect",
+            "ignore_err",
+            "-max_error_rate",
+            "1.0",
+        ]
+    base_cmd += ["-i", str(in_path)]
+
     if audio_policy == "always_copy" or (audio_policy == "copy_if_lossy" and lossy_in):
         return [
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-nostdin",
-                "-y",
-                "-i",
-                str(in_path),
+            base_cmd
+            + [
                 "-map_metadata",
                 "0",
                 "-map_chapters",
@@ -341,13 +366,7 @@ def build_audio_candidates(
         ]
 
     if has_encoder("libopus"):
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-nostdin",
-            "-y",
-            "-i",
-            str(in_path),
+        cmd = base_cmd + [
             "-map_metadata",
             "0",
             "-map_chapters",
@@ -370,13 +389,8 @@ def build_audio_candidates(
         return [cmd]
 
     return [
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-nostdin",
-            "-y",
-            "-i",
-            str(in_path),
+        base_cmd
+        + [
             "-map_metadata",
             "0",
             "-map_chapters",
@@ -401,15 +415,22 @@ def build_image_candidates(
     avif_crf: int,
     avif_pix_fmt: str,
     src_pix_fmt: Optional[str],
+    tolerate_corrupt: bool = False,
 ) -> List[List[str]]:
+    base_cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
+    if tolerate_corrupt:
+        base_cmd += [
+            "-fflags",
+            "+discardcorrupt",
+            "-err_detect",
+            "ignore_err",
+            "-max_error_rate",
+            "1.0",
+        ]
+    base_cmd += ["-i", str(in_path)]
+
     if image_codec == "webp":
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-nostdin",
-            "-y",
-            "-i",
-            str(in_path),
+        cmd = base_cmd + [
             "-frames:v",
             "1",
             "-c:v",
@@ -436,15 +457,10 @@ def build_image_candidates(
             avif_crf=avif_crf,
             avif_pix_fmt=avif_pix_fmt,
             src_pix_fmt=src_pix_fmt,
+            tolerate_corrupt=tolerate_corrupt,
         )
 
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-nostdin",
-        "-y",
-        "-i",
-        str(in_path),
+    cmd = base_cmd + [
         "-frames:v",
         "1",
         "-c:v",

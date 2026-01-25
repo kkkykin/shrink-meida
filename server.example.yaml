@@ -51,5 +51,9 @@ routes:
     out_root: /videos/output
     # scan_interval_seconds: 600
     profile:
+      # video_encoder: auto|auto_gpu|hevc_nvenc|libx265|libx264
+      # - auto: 优先 NVENC，失败回退 CPU
+      # - auto_gpu: 优先 NVENC；仅在 NVENC 不可用时才用 CPU（NVENC 可用但转码失败会直接 copy 原文件兜底）
       video_encoder: libx265
+      # tolerate_corrupt: true # 对“可播放但有坏帧/坏包”的输入更宽容（可能丢帧/有瑕疵，但尽量不因解码错误而失败）
       video_crf: 28

@@ -18,6 +18,18 @@ from .transport import download_file, upload_file_chunked
 
 logger = logging.getLogger(__name__)
 
+# NOTE: This is intentionally loaded lazily (and patchable for unit tests).
+process_one_local = None
+
+
+def _ensure_process_one_local():
+    global process_one_local
+    if process_one_local is None:
+        from shrink_media.processor import process_one_local as pol
+
+        process_one_local = pol
+    return process_one_local
+
 
 @dataclass
 class WorkerConfig:
@@ -209,7 +221,7 @@ class Worker:
 
                 # Process
                 print(f"[{task_id}] Transcoding...")
-                from shrink_media.processor import process_one_local
+                _ensure_process_one_local()
 
                 transcode_start = time.time()
                 result = process_one_local(
@@ -238,6 +250,7 @@ class Worker:
                     comic_keep_non_images=profile.get("comic_keep_non_images", False),
                     comic_accept_bigger=profile.get("comic_accept_bigger", False),
                     archive_password=profile.get("archive_password"),
+                    tolerate_corrupt=profile.get("tolerate_corrupt", False),
                     out_name_mode="suffix",
                     src_size_hint=task["src_size"],
                 )

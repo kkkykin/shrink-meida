@@ -64,6 +64,7 @@ def process_one_local(
     comic_accept_bigger: bool,
     archive_password: Optional[str],
     out_name_mode: str,
+    tolerate_corrupt: bool = False,
     rel_override: Optional[str] = None,
     out_rel_override: Optional[str] = None,
     src_size_hint: int = 0,
@@ -302,6 +303,7 @@ def process_one_local(
             video_preset=video_preset,
             pix_fmt=pix_fmt,
             faststart=faststart,
+            tolerate_corrupt=tolerate_corrupt,
         )
         return _transcode_or_copy(candidates, out_final)
 
@@ -309,7 +311,7 @@ def process_one_local(
         out_final = dst_base.with_suffix(".opus" if audio_policy != "always_copy" else src_local.suffix)
         out_final = apply_out_name_mode(out_final, src_rel=rel, target_ext=out_final.suffix, out_name_mode=out_name_mode)
         out_final = apply_out_override(out_final)
-        cmds = build_audio_candidates(src_arg, out_final, info, audio_policy=audio_policy)
+        cmds = build_audio_candidates(src_arg, out_final, info, audio_policy=audio_policy, tolerate_corrupt=tolerate_corrupt)
         if not cmds:
             if dry_run:
                 return JobResult(True, "dry-run", "no audio stream -> copy", None, rel)
@@ -337,6 +339,7 @@ def process_one_local(
             avif_crf=avif_crf,
             avif_pix_fmt=avif_pix_fmt,
             src_pix_fmt=src_pf,
+            tolerate_corrupt=tolerate_corrupt,
         )
         return _transcode_or_copy(candidates, out_final)
 

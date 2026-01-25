@@ -91,9 +91,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     ap.add_argument(
         "--video-encoder",
-        choices=["auto", "hevc_nvenc", "libx265", "libx264"],
+        choices=["auto", "auto_gpu", "hevc_nvenc", "libx265", "libx264"],
         default="auto",
-        help="auto 优先 hevc_nvenc，失败自动回退 libx265/libx264",
+        help="auto 优先 hevc_nvenc，失败自动回退 libx265/libx264；auto_gpu=优先用 GPU（NVENC），仅在 GPU 不可用时才用 CPU",
     )
     ap.add_argument("--video-crf", type=int, default=22, help="x265/x264 为 CRF；NVENC 为 QP（越小越清晰）")
     ap.add_argument("--video-preset", type=str, default="slow")
